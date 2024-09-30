@@ -1,0 +1,95 @@
+# Rust
+/target/
+/**/*.rs.bk
+Cargo.lock
+**/*.log
+**/*.bak
+**/target/
+/Cargo.lock
+*.rs.bk
+# Binaries
+*.exe
+*.out
+*.lo
+*.a
+*.dylib
+*.dll
+*.so
+*.rlib
+*.d
+# Generated files
+**/*.generated.rs
+**/*.generated.s
+**/*.generated.h
+# Rustfmt
+**/.rustfmt.toml
+# Clippy
+**/.clippy.toml
+# IDEs and editors
+.idea/
+.vscode/
+*.iml
+# MacOS specific
+.DS_Store
+.Trashes
+
+# Java
+/.classpath
+/.project
+/.settings/
+/target/
+/out/
+/bin/
+/build/
+/.gradle/
+/.idea/
+/.vscode/
+/*.class
+*.jar
+*.war
+*.ear
+*.iml
+*.log
+*.project
+*.classpath
+.gradle/
+/.idea/
+/.mvn/
+/target/
+!.mvn/wrapper/maven-wrapper.jar
+**/MANIFEST.MF
+**/module-info.java
+**/*.iml
+**/*.ipr
+**/*.iws
+**/*.log
+**/*.pid
+
+# Android
+# Android Studio files
+/.idea/
+/.gradle/
+/build/
+**/build/
+**/local.properties
+**/.gradle/
+/captures/
+/externalNativeBuild/
+/cxx/
+/output.json
+/.cxx/
+/local.properties
+/.vscode/
+**/*.apk
+**/*.ap_
+*.keystore
+*.jks
+output.json
+*.log
+/*.iml
+.gradle/
+**/.gradle/
+**/local.properties
+**/.idea/
+**/build/
+**/captures/

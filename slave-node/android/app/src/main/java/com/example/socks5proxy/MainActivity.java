@@ -1,0 +1,147 @@
+package com.example.socks5proxy;
+
+import android.os.Bundle;
+import android.util.Log;
+import android.view.View;
+import android.widget.Button;
+import androidx.appcompat.app.AppCompatActivity;
+
+import java.nio.charset.StandardCharsets;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.buffer.ByteBuf;
+
+public class MainActivity extends AppCompatActivity {
+
+    private NioEventLoopGroup group;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        Button startButton = findViewById(R.id.startButton);
+        startButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startProxyServer();
+            }
+        });
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Socks5Server.main(null);  // Start the SOCKS5 server
+                } catch (InterruptedException e) {
+                    Log.e("Socks5Server", "Server interrupted", e);
+                }
+            }
+        }).start();
+    }
+
+    private void startProxyServer() {
+        group = new NioEventLoopGroup();
+
+        String host = "188.245.104.81";
+        int port = 8000;
+
+        Bootstrap bootstrap = new Bootstrap();
+        bootstrap.group(new NioEventLoopGroup())
+                .channel(NioSocketChannel.class)
+                .handler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel ch) throws Exception {
+                        ChannelPipeline p = ch.pipeline();
+                        p.addLast(new ByteInboundHandler(host, port, group));
+                    }
+                });
+
+        ChannelFuture future = bootstrap.connect(host, port);
+        future.addListener(f -> {
+            if (f.isSuccess()) {
+                runOnUiThread(() -> {
+                    // Update UI if needed, e.g., show a Toast
+                    // Toast.makeText(MainActivity.this, "Connected to " + host + ":" + port, Toast.LENGTH_SHORT).show();
+                });
+            } else {
+                runOnUiThread(() -> {
+                    // Update UI if needed, e.g., show an error Toast
+                    // Toast.makeText(MainActivity.this, "Connection failed", Toast.LENGTH_SHORT).show();
+                });
+            }
+        });
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (group != null) {
+            group.shutdownGracefully();
+        }
+    }
+
+    private class ByteInboundHandler extends SimpleChannelInboundHandler<ByteBuf> {
+        private final String host;
+        private final int port;
+        private final NioEventLoopGroup group;
+
+        public ByteInboundHandler(String host, int port, NioEventLoopGroup group) {
+            this.host = host;
+            this.port = port;
+            this.group = group;
+        }
+
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+            if (in.readableBytes() >= 1) {
+                byte receivedByte = in.readByte();
+                if (receivedByte == 55) {
+                    // Handle the received byte and start a new connection
+                    NioEventLoopGroup newGroup = new NioEventLoopGroup();
+                    Bootstrap bootstrap2 = new Bootstrap();
+                    bootstrap2.group(newGroup)
+                            .channel(NioSocketChannel.class)
+                            .handler(new ChannelInitializer<SocketChannel>() {
+                                @Override
+                                protected void initChannel(SocketChannel ch) throws Exception {
+                                    ChannelPipeline p = ch.pipeline();
+                                    p.addLast(new Socks5Server.Socks5ServerHandler());
+//                                    p.addLast(new SimpleChannelInboundHandler<ByteBuf>() {
+//                                        @Override
+//                                        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+//                                            // Handle incoming data from www.google.com
+//                                            while (in.isReadable()) {
+//                                                System.out.print((char) in.readByte());
+//                                            }
+//                                        }
+//                                    });
+
+                                }
+                            });
+
+                    ChannelFuture future2 = bootstrap2.connect(host, port);
+                    future2.addListener(f -> {
+                        if (f.isSuccess()) {
+                            System.out.println("Connected to " + host + ":" + port + " (Secondary Channel)");
+                        } else {
+                            System.err.println("Connection failed (Secondary Channel)");
+                        }
+                    });
+
+                    future2.channel().closeFuture().addListener(closeFuture -> newGroup.shutdownGracefully());
+                }
+            }
+        }
+    }
+}
