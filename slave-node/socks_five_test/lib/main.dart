@@ -25,6 +25,10 @@ class _MyHomePageState extends State<MyHomePage> {
   Socket? _primarySocket;
   Socket? _secondarySocket;
   double? internetSpeed;
+  bool _isConnected = false;
+  bool _isConnecting = false;
+  int _retryAttempts = 0;
+  String _connectionStatus = "";
 
   @override
   void initState() {
@@ -72,15 +76,46 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  void _startProxyServer() async {
-    // final host = '188.245.104.81';
-    final host = '192.168.8.162';
+  // Retry logic to reconnect when connection is broken
+  Future<void> _retryConnection() {
+    if (_retryAttempts < 5) {
+      Future.delayed(Duration(seconds: 5), () async {
+        _retryAttempts++;
+        print('Retrying connection... Attempt $_retryAttempts');
+        await _startProxyServer();
+      });
+    } else {
+      print('Failed to reconnect after $_retryAttempts attempts');
+      setState(() {
+        _isConnecting = false;
+      });
+    }
+
+    return Future.value();
+  }
+
+  Future<void> _startProxyServer() async {
+    setState(() {
+      _isConnecting = true;
+      _connectionStatus = "Connecting...";
+    });
+
+    final host = '188.245.104.81';
+    // final host = '192.168.12.244';
+
     final port = 8000;
+    
     final dataport = 8001;
 
     try {
       _primarySocket = await Socket.connect(host, port);
       print('Connected to primary socket: $host:$port');
+
+      setState(() {
+        _isConnected = true;
+        _isConnecting = false;
+        _connectionStatus = "Establishsed primary connection";
+      });
 
       _sendSpeedToMaster();
 
@@ -90,16 +125,33 @@ class _MyHomePageState extends State<MyHomePage> {
         },
         onDone: () {
           print('Primary connection closed');
-          _primarySocket?.close();
+          setState(() {
+            _isConnected = false;
+            _isConnecting = false;
+            _connectionStatus = "Connectin closed, trying to reconnect...";
+          });
+          _retryConnection();
         },
         onError: (error) {
           print('Primary connection error: $error');
           _primarySocket?.close();
+          setState(() {
+            _isConnected = false;
+            _isConnecting = false;
+            _connectionStatus = "Connection error, trying to reconnect...";
+          });
+          _retryConnection();
         },
       );
     } catch (e) {
       print('Failed to connect to primary connection: $e');
+      setState(() {
+        _isConnecting = false;
+        _connectionStatus = "Failed to connect, trying to reconnect...";
+      });
+      _retryConnection();
     }
+    return Future.value();
   }
 
   void _handlePrimaryConnectionData(List<int> data, String host, int port, int dataport) {
@@ -117,11 +169,29 @@ class _MyHomePageState extends State<MyHomePage> {
     try {
       _secondarySocket = await Socket.connect(host, port);
       print('Connected to $host:$port (Secondary Connection)');
+      setState(() {
+        _connectionStatus = "Establishsed data connection";
+      });
       
       Socks5ServerHandler obj = Socks5ServerHandler(_secondarySocket!);
       obj.start();
     } catch (e) {
       print('Failed to connect to secondary channel: $e');
+      setState(() {
+        _connectionStatus = "Failed to establish secondary connection";
+      });
+    }
+  }
+
+  // Stop proxy server and close connection
+  void _stopProxyServer() {
+    if (_primarySocket != null) {
+      _primarySocket!.close();
+      setState(() {
+        _isConnected = false;
+        _connectionStatus = "Disconnected";
+      });
+      print('Proxy server stopped');
     }
   }
 
@@ -142,9 +212,25 @@ class _MyHomePageState extends State<MyHomePage> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
+            // Connection status bar
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Text(
+                '$_connectionStatus',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+            // Stop Proxy Button
             ElevatedButton(
-              onPressed: _startProxyServer,
-              child: Text('Start Proxy Server'),
+              onPressed: _isConnected ? _stopProxyServer : null,
+              child: Text('Stop Proxy'),
+            ),
+            SizedBox(height: 20),
+            // Start Proxy Button
+            FloatingActionButton(
+              onPressed: (!_isConnected && !_isConnecting) ? _startProxyServer : null,
+              tooltip: 'Start Proxy',
+              child: Icon(Icons.play_arrow),
             ),
             SizedBox(height: 20),
             internetSpeed == null
