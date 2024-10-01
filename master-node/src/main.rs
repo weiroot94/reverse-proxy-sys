@@ -2,15 +2,15 @@ mod utils;
 mod socks;
 mod LBlib;
 
-use LBlib::{random_weight::*, roundrobin_weight::*, smooth_weight::*, Weight}; // Import items from the LBlib module
+use LBlib::{random_weight::*, roundrobin_weight::*, smooth_weight::*, Weight};
 
 use std::collections::HashMap;
-use std::error::Error; // Import the Error trait
+use std::error::Error;
 use log::LevelFilter;
 use net2::TcpStreamExt;
 use simple_logger::SimpleLogger;
 use getopts::Options;
-use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, task, net::{TcpListener, TcpStream}};
+use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, task, net::{TcpListener, TcpStream}, signal};
 use utils::MAGIC_FLAG;
 use utils::MODULAS;
 use std::sync::{Arc, Mutex};
@@ -22,7 +22,6 @@ struct ProxyManager {
 }
 
 impl ProxyManager {
-    // Constructor for initializing ProxyManager
     fn new() -> Self {
         ProxyManager {
             round_robin_weight: Arc::new(Mutex::new(RoundrobinWeight::new())),
@@ -76,7 +75,7 @@ async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<Prox
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
             Err(e) => {
-                log::error!("error: {}", e);
+                log::error!("Error accepting connection: {}", e);
                 return Err(Box::new(e)); // Return the error instead of Ok
             }
             Ok(p) => p,
@@ -88,9 +87,10 @@ async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<Prox
 
         log::info!("Accepted slave from: {}:{}", slave_addr.ip(), slave_addr.port());
 
-		// Send reserved code to announce speed test to the client side
+		// Simulate speed test by sending dummy data
 		if let Err(e) = slave_stream.write_all(&[MAGIC_FLAG[1]]).await{
-			log::error!("error : {}" , e);
+			log::error!("Error sending dummy payload flag: {}", e);
+            continue;
 		};
 
 		// 5MB data to simulate download speed test
@@ -98,11 +98,8 @@ async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<Prox
 
 		// Send the test data to the client
         match slave_stream.write_all(&test_data).await {
-            Ok(_) => log::info!("Sent dummy payload to check client's net speed"),
-            Err(e) => {
-                log::error!("Failed to send data to client: {}", e);
-                continue;
-            }
+            log::error!("Failed to send data to client");
+            continue;
         }
 
 		// Wait for the client to acknowledge the time taken to receive the data
@@ -125,16 +122,9 @@ async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<Prox
 		// Calculate the speed (5MB in Mbps)
         let data_size = 5_000_000.0 * 8.0 / 1_000_000.0;
         let download_speed_mbps = data_size / client_time;
-
-        log::info!(
-            "Client {} download speed: {:.2} Mbps",
-            slave_addr,
-            download_speed_mbps
-        );
-
 		let weight = (download_speed_mbps.round() as isize);
 
-        log::info!("{}'s weight is {}", slave_addr.ip(), weight);
+        log::info!("Client {}'s weight: {}", slave_addr.ip(), weight);
 
 		proxy_manager.add_weight(slave_addr.ip().to_string(), weight);
         proxy_manager.insert_stream(slave_addr.ip().to_string(), slave_stream);
@@ -143,9 +133,15 @@ async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<Prox
 
 #[tokio::main]
 async fn main() -> io::Result<()>  {
-	SimpleLogger::new().with_utc_timestamps().with_utc_timestamps().with_colors(true).init().unwrap();
-	::log::set_max_level(LevelFilter::Info);
+	// Initialize logging system
+    SimpleLogger::new()
+        .with_utc_timestamps()
+        .with_colors(true)
+        .init()
+        .unwrap();
+    ::log::set_max_level(LevelFilter::Info);
 
+	// Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let program = args[0].clone();
 
@@ -183,6 +179,13 @@ async fn main() -> io::Result<()>  {
 		usage(&program, &opts);
 		std::process::exit(-1);
 	});
+
+	// Set up a graceful shutdown signal handler
+    tokio::spawn(async {
+        signal::ctrl_c().await.expect("Failed to listen for shutdown signal");
+        log::info!("Shutting down gracefully...");
+        // Perform any necessary cleanup here
+    });
 
 	if matches.opt_count("l") > 0{
 		let local_address : String = match match matches.opt_str("l"){
@@ -266,7 +269,7 @@ async fn main() -> io::Result<()>  {
 		
 		let slave_listener = match TcpListener::bind(&master_addr).await{
 			Err(e) => {
-				log::error!("error : {}", e);
+				log::error!("Failed to bind slave listener : {}", e);
 				return Ok(());
 			},
 			Ok(p) => p
@@ -274,7 +277,7 @@ async fn main() -> io::Result<()>  {
 
 		let slave_data_listener = match TcpListener::bind(&master_data_addr).await{
 			Err(e) => {
-				log::error!("error : {}", e);
+				log::error!("Failed to bind data listenr : {}", e);
 				return Ok(());
 			},
 			Ok(p) => p
@@ -291,11 +294,11 @@ async fn main() -> io::Result<()>  {
 		});
 	
 		
-		log::info!("listen to : {}" , socks_addr);
+		log::info!("SOCKS5 server is listening on {}" , socks_addr);
 		
 		let listener = match TcpListener::bind(&socks_addr).await{
 			Err(e) => {
-				log::error!("error : {}", e);
+				log::error!("Failed to bind SOCKS5 listener : {}", e);
 				return Ok(());
 			},
 			Ok(p) => p
@@ -303,7 +306,7 @@ async fn main() -> io::Result<()>  {
 
 		loop {
 			let (stream , client_addr) = listener.accept().await.unwrap();
-			log::info!("accept from client : {}" , client_addr.ip());
+			log::info!("Accepted connection from client : {}" , client_addr.ip());
 
 			// Check if there are any slave streams available
 			{

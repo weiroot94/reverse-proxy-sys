@@ -26,6 +26,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Socket? _secondarySocket;
   bool _isConnected = false;
   bool _isConnecting = false;
+  bool _isManualyStopped = false;
   int _retryAttempts = 0;
   String _connectionStatus = "";
 
@@ -61,6 +62,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> _startProxyServer() async {
     setState(() {
       _isConnecting = true;
+      _isManualyStopped = false;
       _connectionStatus = "Connecting...";
     });
 
@@ -90,9 +92,11 @@ class _MyHomePageState extends State<MyHomePage> {
           setState(() {
             _isConnected = false;
             _isConnecting = false;
-            _connectionStatus = "Connectin closed, trying to reconnect...";
+            _connectionStatus = "Connection closed";
           });
-          _retryConnection();
+
+          if (!_isManualyStopped)
+            _retryConnection();
         },
         onError: (error) {
           print('Primary connection error: $error');
@@ -189,6 +193,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _primarySocket!.close();
       setState(() {
         _isConnected = false;
+        _isManualyStopped = true;
         _connectionStatus = "Disconnected";
       });
       print('Proxy server stopped');
