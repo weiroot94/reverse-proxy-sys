@@ -15,28 +15,52 @@ use utils::MAGIC_FLAG;
 use utils::MODULAS;
 use std::sync::{Arc, Mutex};
 
-// Using lazy_static to define global variables
-#[macro_use]
-extern crate lazy_static;
-
-lazy_static! {
-	//for selecting slave node using weight
-    static ref G_SW: Arc<Mutex<RoundrobinWeight<String>>> = Arc::new(Mutex::new(RoundrobinWeight::new()));
-
-	//for getting tcp stream from ip
-    static ref G_STREAMS: Arc<Mutex<HashMap<String, Arc<Mutex<TcpStream>>>>> = Arc::new(Mutex::new(HashMap::new()));
-
-	//for getting slave ip from client ip
-    static ref G_MATCHES: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+struct ProxyManager {
+    round_robin_weight: Arc<Mutex<RoundrobinWeight<String>>>,
+    streams: Arc<Mutex<HashMap<String, Arc<Mutex<TcpStream>>>>>,
+    matches: Arc<Mutex<HashMap<String, String>>>,
 }
 
-// Function to get the value from the HashMap
-fn get_value( key: String) -> String {
-	let mut map = G_MATCHES.lock().unwrap();
+impl ProxyManager {
+    // Constructor for initializing ProxyManager
+    fn new() -> Self {
+        ProxyManager {
+            round_robin_weight: Arc::new(Mutex::new(RoundrobinWeight::new())),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            matches: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 
-    match map.get(&key) {
-        Some(value) => value.clone(), // Return the value if it exists
-        None => "EMPTY".to_string(),  // Return "EMPTY" if it doesn't
+    // Add weight for slave IP
+    fn add_weight(&self, ip: String, weight: isize) {
+        let mut g_sw = self.round_robin_weight.lock().unwrap();
+        g_sw.add(ip, weight);
+    }
+
+    // Insert a new stream for the slave IP
+    fn insert_stream(&self, ip: String, stream: TcpStream) {
+        let mut g_streams = self.streams.lock().unwrap();
+        g_streams.insert(ip, Arc::new(Mutex::new(stream)));
+    }
+
+    // Get a stream by IP
+    fn get_stream(&self, ip: &String) -> Option<Arc<Mutex<TcpStream>>> {
+        let g_streams = self.streams.lock().unwrap();
+        g_streams.get(ip).cloned()
+    }
+
+    // Get or assign a new slave IP based on the client IP
+    fn get_or_assign_slave(&self, client_ip: String) -> String {
+        let mut g_matches = self.matches.lock().unwrap();
+        match g_matches.get(&client_ip) {
+            Some(slave_ip) => slave_ip.clone(),
+            None => {
+                let mut g_sw = self.round_robin_weight.lock().unwrap();
+                let slave_ip = g_sw.next().unwrap();
+                g_matches.insert(client_ip.clone(), slave_ip.clone());
+                slave_ip
+            }
+        }
     }
 }
 
@@ -48,7 +72,7 @@ fn usage(program: &str, opts: &Options) {
     print!("{}", opts.usage(&brief));
 }
 
-async fn handle_connections(slave_listener: TcpListener) -> Result<(), Box<dyn Error>> {
+async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<ProxyManager>) -> Result<(), Box<dyn Error>> {
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
             Err(e) => {
@@ -72,12 +96,9 @@ async fn handle_connections(slave_listener: TcpListener) -> Result<(), Box<dyn E
 		// 5MB data to simulate download speed test
         let test_data = vec![0u8; 5_000_000];
 
-		// Start measuring the time before sending the data
-        let start_time = std::time::Instant::now();
-
 		// Send the test data to the client
         match slave_stream.write_all(&test_data).await {
-            Ok(_) => log::info!("Sent test data to client"),
+            Ok(_) => log::info!("Sent dummy payload to check client's net speed"),
             Err(e) => {
                 log::error!("Failed to send data to client: {}", e);
                 continue;
@@ -115,11 +136,8 @@ async fn handle_connections(slave_listener: TcpListener) -> Result<(), Box<dyn E
 
         log::info!("{}'s weight is {}", slave_addr.ip(), weight);
 
-		let mut g_sw = G_SW.lock().unwrap();
-		let mut g_streams = G_STREAMS.lock().unwrap();
-
-        g_sw.add(slave_addr.ip().to_string(), weight);
-        g_streams.insert(slave_addr.ip().to_string(),  Arc::new(Mutex::new(slave_stream)));
+		proxy_manager.add_weight(slave_addr.ip().to_string(), weight);
+        proxy_manager.insert_stream(slave_addr.ip().to_string(), slave_stream);
     }
 }
 
@@ -130,6 +148,9 @@ async fn main() -> io::Result<()>  {
 
     let args: Vec<String> = std::env::args().collect();
     let program = args[0].clone();
+
+	// Global store of proxy system
+	let proxy_manager = Arc::new(ProxyManager::new());
 
     let mut opts = Options::new();
 
@@ -260,9 +281,12 @@ async fn main() -> io::Result<()>  {
 		};
 
 		// Create a new thread
-		tokio::spawn(async move {
-			if let Err(e) = handle_connections(slave_listener).await {
-				log::error!("Connection handler error: {}", e);
+		tokio::spawn({
+			let proxy_manager = Arc::clone(&proxy_manager); // Clone the Arc to move into the async block
+			async move {
+				if let Err(e) = handle_connections(slave_listener, proxy_manager).await {
+					log::error!("Connection handler error: {}", e);
+				}
 			}
 		});
 	
@@ -281,108 +305,85 @@ async fn main() -> io::Result<()>  {
 			let (stream , client_addr) = listener.accept().await.unwrap();
 			log::info!("accept from client : {}" , client_addr.ip());
 
-			let mut g_streams = G_STREAMS.lock().unwrap();
-			if(g_streams.is_empty())
+			// Check if there are any slave streams available
 			{
-				log::warn!("no slave is connected to master");
-				continue;
+				let g_streams = proxy_manager.streams.lock().unwrap();
+				if g_streams.is_empty() {
+					log::warn!("No slave is connected to master");
+					continue;
+				}
 			}
 
 			let raw_stream = stream.into_std().unwrap();
 			raw_stream.set_keepalive(Some(std::time::Duration::from_secs(10))).unwrap();
 			let mut stream = TcpStream::from_std(raw_stream).unwrap();
 
-			// Check corresponding slave node with current client
-			let matched_slave = get_value(client_addr.ip().to_string());
-			let mut selected_slave_ip: String = "".to_string();
-			let mut new_string: String = "".to_string();
+			// Get or assign a corresponding slave node for the current client using ProxyManager
+			let selected_slave_ip = proxy_manager.get_or_assign_slave(client_addr.ip().to_string());
 
-			if matched_slave == "EMPTY" {
-				log::warn!("should select new slave");
-				//select slave node according to algorithm
-				let mut g_sw = G_SW.lock().unwrap();
-				new_string = g_sw.next().unwrap();
-				selected_slave_ip = new_string.clone();
-				
-				//add 2 ips into hash map
-				let mut g_ipmatch = G_MATCHES.lock().unwrap();
-				let ipclone: String = new_string.clone();
-				g_ipmatch.insert( client_addr.ip().to_string(), ipclone);
-			} else {
-				new_string = matched_slave.clone();
-				selected_slave_ip = matched_slave.clone();
-			}
-
-			if let Some(stream_s) = g_streams.get(&selected_slave_ip) {
-				log::info!("Found TcpStream for IP: {}", new_string);
-				let mut slave_stream = stream_s.lock().unwrap();
-
-				if let Err(e) = slave_stream.write_all(&[MAGIC_FLAG[0]]).await{
-					log::error!("error : {}" , e);
+			// Retrieve the stream corresponding to the selected slave IP
+			if let Some(slave_stream_arc) = proxy_manager.get_stream(&selected_slave_ip) {
+				log::info!("Found TcpStream for IP: {}", selected_slave_ip);
+	
+				let mut slave_stream = slave_stream_arc.lock().unwrap();
+	
+				// Send a magic flag to the slave node
+				if let Err(e) = slave_stream.write_all(&[MAGIC_FLAG[0]]).await {
+					log::error!("Error: {}", e);
 					break;
-				};
-
-				let (proxy_stream , slave_addr) = match slave_data_listener.accept().await{
+				}
+	
+				// Wait for the secondary connection to be established (slave connection)
+				let (proxy_stream, slave_addr) = match slave_data_listener.accept().await {
 					Err(e) => {
-						log::error!("error : {}", e);
+						log::error!("Error: {}", e);
 						return Ok(());
-					},
-					Ok(p) => p
+					}
+					Ok(p) => p,
 				};
-
-				let raw_stream = proxy_stream.into_std().unwrap();
-				raw_stream.set_keepalive(Some(std::time::Duration::from_secs(10))).unwrap();
-				let mut proxy_stream = TcpStream::from_std(raw_stream).unwrap();
 	
-				//log::info!("accept from slave : {}:{}" , slave_addr.ip() , slave_addr.port() );
-				task::spawn(async move {
-					let mut buf1 = [0u8 ; 1024];
-					let mut buf2 = [0u8 ; 1024];
+				let raw_proxy_stream = proxy_stream.into_std().unwrap();
+				raw_proxy_stream.set_keepalive(Some(std::time::Duration::from_secs(10))).unwrap();
+				let mut proxy_stream = TcpStream::from_std(raw_proxy_stream).unwrap();
 	
-					loop{
+				// Spawn a task to handle the proxying between the client and the slave
+				tokio::spawn(async move {
+					let mut buf1 = [0u8; 1024];
+					let mut buf2 = [0u8; 1024];
+	
+					loop {
 						tokio::select! {
 							a = proxy_stream.read(&mut buf1) => {
-			
 								let len = match a {
-									Err(_) => {
-										break;
-									}
+									Err(_) => break,
 									Ok(p) => p
 								};
 								match stream.write_all(&buf1[..len]).await {
-									Err(_) => {
-										break;
-									}
-									Ok(p) => p
-								};
-			
+									Err(_) => break,
+									Ok(_) => {}
+								}
 								if len == 0 {
 									break;
 								}
 							},
-							b = stream.read(&mut buf2) =>  { 
-								let len = match b{
-									Err(_) => {
-										break;
-									}
+							b = stream.read(&mut buf2) =>  {
+								let len = match b {
+									Err(_) => break,
 									Ok(p) => p
 								};
 								match proxy_stream.write_all(&buf2[..len]).await {
-									Err(_) => {
-										break;
-									}
-									Ok(p) => p
-								};
+									Err(_) => break,
+									Ok(_) => {}
+								}
 								if len == 0 {
 									break;
 								}
 							},
 						}
 					}
-					//log::info!("transfer [{}:{}] finished" , slave_addr.ip() , slave_addr.port());
 				});
 			} else {
-				println!("TcpStream not found.");
+				log::warn!("TcpStream for selected slave IP not found.");
 			}
 		}
 	 }else if matches.opt_count("r") > 0 {
