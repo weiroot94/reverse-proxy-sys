@@ -64,24 +64,61 @@ async fn handle_connections(slave_listener: TcpListener) -> Result<(), Box<dyn E
 
         log::info!("Accepted slave from: {}:{}", slave_addr.ip(), slave_addr.port());
 
-        let mut weightbuffer = [0u8; 1024];
-        let bytes_read = slave_stream.read(&mut weightbuffer).await?;
+		// Send reserved code to announce speed test to the client side
+		if let Err(e) = slave_stream.write_all(&[MAGIC_FLAG[1]]).await{
+			log::error!("error : {}" , e);
+		};
 
-        // Convert the buffer to a string slice
-        let string_data = std::str::from_utf8(&weightbuffer[..bytes_read])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+		// 5MB data to simulate download speed test
+        let test_data = vec![0u8; 5_000_000];
 
-        // Parse the string to f64, multiply by 100, and convert to isize
-        let value: isize = string_data.trim().parse::<f64>()
-            .map(|v| (v ).round() as isize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+		// Start measuring the time before sending the data
+        let start_time = std::time::Instant::now();
 
-        log::info!("{}'s weight is {}, {}", slave_addr.ip(), string_data, value/MODULAS);
+		// Send the test data to the client
+        match slave_stream.write_all(&test_data).await {
+            Ok(_) => log::info!("Sent test data to client"),
+            Err(e) => {
+                log::error!("Failed to send data to client: {}", e);
+                continue;
+            }
+        }
+
+		// Wait for the client to acknowledge the time taken to receive the data
+        let mut buffer = [0u8; 1024];
+        let bytes_read = match slave_stream.read(&mut buffer).await {
+            Ok(bytes) if bytes > 0 => bytes,
+            _ => continue,
+        };
+
+		// Parse the response time sent by the client
+        let received_time = String::from_utf8_lossy(&buffer[..bytes_read]);
+        let client_time: f64 = match received_time.trim().parse() {
+            Ok(value) => value,
+            Err(_) => {
+                log::warn!("Failed to parse client's time");
+                continue;
+            }
+        };
+
+		// Calculate the speed (5MB in Mbps)
+        let data_size = 5_000_000.0 * 8.0 / 1_000_000.0;
+        let download_speed_mbps = data_size / client_time;
+
+        log::info!(
+            "Client {} download speed: {:.2} Mbps",
+            slave_addr,
+            download_speed_mbps
+        );
+
+		let weight = (download_speed_mbps.round() as isize);
+
+        log::info!("{}'s weight is {}", slave_addr.ip(), weight);
 
 		let mut g_sw = G_SW.lock().unwrap();
 		let mut g_streams = G_STREAMS.lock().unwrap();
 
-        g_sw.add(slave_addr.ip().to_string(), value/MODULAS);
+        g_sw.add(slave_addr.ip().to_string(), weight);
         g_streams.insert(slave_addr.ip().to_string(),  Arc::new(Mutex::new(slave_stream)));
     }
 }

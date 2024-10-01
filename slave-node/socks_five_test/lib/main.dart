@@ -24,56 +24,20 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   Socket? _primarySocket;
   Socket? _secondarySocket;
-  double? internetSpeed;
   bool _isConnected = false;
   bool _isConnecting = false;
   int _retryAttempts = 0;
   String _connectionStatus = "";
 
+  // Perform Internet speed test
+  bool _inCheckingSpeedStage = false;
+  final int _expectedDataSize = 5000000;
+  int _recvBytes = 0;
+  Stopwatch? _checkTimer;
+
   @override
   void initState() {
     super.initState();
-    _getInternetSpeed();
-  }
-
-  Future<void> _getInternetSpeed() async {
-    setState(() {
-      internetSpeed = null;  // To show loading state
-    });
-
-    try {
-      final url = Uri.parse('https://speed.cloudflare.com/__down?bytes=5000000');  // For speed testing
-      final stopwatch = Stopwatch()..start();
-      final response = await http.get(url);
-      stopwatch.stop();
-
-      if (response.statusCode == 200) {
-        final elapsedTime = stopwatch.elapsedMilliseconds / 1000; // Time in seconds
-        final speedMbps = (response.contentLength! * 8 / 1000000) / elapsedTime;
-        setState(() {
-          internetSpeed = speedMbps;
-          _sendSpeedToMaster();
-        });
-      } else {
-        setState(() {
-          internetSpeed = 0.0;
-        });
-      }
-    } catch (e) {
-      setState(() {
-        internetSpeed = 0.0;
-      });
-    }
-  }
-
-  // Function to send internet speed to master
-  void _sendSpeedToMaster() async {
-    if (_primarySocket  != null && internetSpeed != null) {
-      print('_sendSpeedToMaster function start');
-      String speedMessage = '${internetSpeed?.toStringAsFixed(2)}';
-      _primarySocket !.write(speedMessage);  // Sending speed data to master
-      print('Sent speed to master: $speedMessage');
-    }
   }
 
   // Retry logic to reconnect when connection is broken
@@ -117,8 +81,6 @@ class _MyHomePageState extends State<MyHomePage> {
         _connectionStatus = "Establishsed primary connection";
       });
 
-      _sendSpeedToMaster();
-
       _primarySocket!.listen(
         (data) {
           _handlePrimaryConnectionData(data, host, port, dataport);
@@ -154,14 +116,52 @@ class _MyHomePageState extends State<MyHomePage> {
     return Future.value();
   }
 
-  void _handlePrimaryConnectionData(List<int> data, String host, int port, int dataport) {
+  void _handlePrimaryConnectionData(List<int> data, String host, int port, int dataport) async {
     if (data.isNotEmpty) {
       final receivedByte = data[0];
-      print('Received data from primary connection: $receivedByte');
-      if (receivedByte == 55) {
-        print('Received byte 55, initiating secondary connection');
-        _startSecondaryConnection(host, dataport);
+
+      if (receivedByte == 56 && !_inCheckingSpeedStage) {
+        _checkTimer = Stopwatch()..start();
+        _inCheckingSpeedStage = true;
+        _recvBytes = 0;
       }
+
+      if (_inCheckingSpeedStage == true) {
+        await _performSpeedTest(data);
+      } else {
+        if (receivedByte == 55) {
+          print('Received byte 55, initiating secondary connection');
+          _startSecondaryConnection(host, dataport);
+        }
+      }
+    }
+  }
+
+  // Perform the speed test
+  Future<void> _performSpeedTest(List<int> data) async {
+    _recvBytes += data.length;
+
+    if (_recvBytes >= _expectedDataSize && _checkTimer != null) {
+      final elapsedTime = _checkTimer!.elapsedMilliseconds / 1000; // Time in seconds
+      _checkTimer!.stop();
+      
+      print('Download completed. Total time: $elapsedTime seconds');
+
+      // Send the elapsed time back to the server
+      _sendSpeedAcknowledgment(elapsedTime);
+
+      _inCheckingSpeedStage = false;
+      _checkTimer = null;
+    }
+  }
+
+  // Send speed acknowledgment to the server
+  void _sendSpeedAcknowledgment(double elapsedTime) {
+    if (_primarySocket != null) {
+      String timeMessage = elapsedTime.toStringAsFixed(2);
+      _primarySocket!.write(timeMessage);  // Send the time taken to the server
+      _inCheckingSpeedStage = false;
+      print('Sent time acknowledgment to server: $timeMessage');
     }
   }
 
@@ -232,13 +232,6 @@ class _MyHomePageState extends State<MyHomePage> {
               tooltip: 'Start Proxy',
               child: Icon(Icons.play_arrow),
             ),
-            SizedBox(height: 20),
-            internetSpeed == null
-                ? CircularProgressIndicator() // Show loading indicator while fetching speed
-                : Text(
-                    'Speed: ${internetSpeed?.toStringAsFixed(2)}Mbps',
-                    style: TextStyle(fontSize: 16),
-                  ),
           ],
         ),
       ),
