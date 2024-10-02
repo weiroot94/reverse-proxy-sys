@@ -43,16 +43,21 @@ class _MyHomePageState extends State<MyHomePage> {
 
   // Retry logic to reconnect when connection is broken
   Future<void> _retryConnection() {
-    if (_retryAttempts < 5) {
+    // Retry logic to reconnect when connection is broken
+    if (_retryAttempts % 5 != 0 || _retryAttempts == 0) {
+      // Retry the connection every 5 seconds
       Future.delayed(Duration(seconds: 5), () async {
         _retryAttempts++;
         print('Retrying connection... Attempt $_retryAttempts');
         await _startProxyServer();
       });
     } else {
-      print('Failed to reconnect after $_retryAttempts attempts');
-      setState(() {
-        _isConnecting = false;
+      // After every 5 attempts, wait for 1 minute
+      print('Reached 5 attempts. Waiting for 1 minute before retrying.');
+      Future.delayed(Duration(minutes: 1), () async {
+        _retryAttempts++;
+        print('Resuming retries after 1 minute. Attempt $_retryAttempts');
+        await _startProxyServer();
       });
     }
 
