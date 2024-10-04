@@ -73,6 +73,28 @@ fn usage(program: &str, opts: &Options) {
     print!("{}", opts.usage(&brief));
 }
 
+// Send a command to the slave to download a file and report back the download speed
+async fn send_speed_test_command(slave_stream: &mut TcpStream) -> Result<f64, Box<dyn std::error::Error>> {
+    let speed_test_url = "https://speed.cloudflare.com/__down?bytes=5000000";
+
+    // Send the speed test command to the slave
+    let command = format!("SPEED_TEST {}\n", speed_test_url);
+    slave_stream.write_all(command.as_bytes()).await?;
+
+    // Read the response from the slave (assuming the slave sends back the speed in Mbps)
+    let mut response = vec![0u8; 1024];
+    let bytes_read = slave_stream.read(&mut response).await?;
+    
+    // Parse the response (expecting a string like "SPEED 12.34\n")
+    let response_str = String::from_utf8_lossy(&response[..bytes_read]);
+    if let Some(speed_str) = response_str.strip_prefix("SPEED ") {
+        let download_speed_mbps: f64 = speed_str.trim().parse()?;
+        Ok(download_speed_mbps)
+    } else {
+        Err("Invalid response from slave".into())
+    }
+}
+
 async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<ProxyManager>) -> Result<(), Box<dyn Error>> {
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
@@ -85,11 +107,20 @@ async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<Prox
 
         let raw_stream = slave_stream.into_std().unwrap();
         raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
-        let slave_stream = TcpStream::from_std(raw_stream).unwrap();
+        let mut slave_stream = TcpStream::from_std(raw_stream).unwrap();
 
         log::info!("Accepted slave from: {}:{}", slave_addr.ip(), slave_addr.port());
 
-        let download_speed_mbps: f32 = 10.12;
+		// Send a speed test request to the slave and measure the internet speed
+        let download_speed_mbps = match send_speed_test_command(&mut slave_stream).await {
+            Ok(speed) => speed,
+            Err(e) => {
+                log::error!("Failed to measure internet speed for slave {}: {}", slave_addr.ip(), e);
+                1.0
+            }
+        };
+
+        // Assign weight based on measured download speed
         let weight = download_speed_mbps.round() as isize;
 
         log::info!("Client {}'s weight: {}", slave_addr.ip(), weight);
@@ -201,7 +232,7 @@ async fn main() -> io::Result<()>  {
 
         log::info!("SOCKS5 server is listening on {}", socks_addr);
 
-        let listener = match TcpListener::bind(&socks_addr).await {
+        let client_listener = match TcpListener::bind(&socks_addr).await {
             Err(e) => {
                 log::error!("Failed to bind SOCKS5 listener: {}", e);
                 return Ok(());
@@ -210,7 +241,7 @@ async fn main() -> io::Result<()>  {
         };
 
         loop {
-            let (client_stream, client_addr) = listener.accept().await.unwrap();
+            let (client_stream, client_addr) = client_listener.accept().await.unwrap();
             log::info!("Accepted connection from client: {}", client_addr.ip());
 
             let streams_available = {

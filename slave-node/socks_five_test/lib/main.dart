@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-// import 'package:http/http.dart' as http;
+import 'package:http/http.dart' as http;
 import 'dart:io';
 import 'dart:typed_data';
 import 'socks5_server.dart';
@@ -71,6 +71,30 @@ class _MyHomePageState extends State<MyHomePage> {
     return Future.value();
   }
 
+  Future<double> _performSpeedTest(String url) async {
+    final stopwatch = Stopwatch()..start();
+
+    try {
+      final response = await http.get(Uri.parse(url));
+      stopwatch.stop();
+
+      if (response.statusCode == 200) {
+        final contentLength = response.contentLength ?? 0;
+        final elapsedTime = stopwatch.elapsedMilliseconds / 1000; // in seconds
+
+        // Calculate speed in Mbps
+        final speedMbps = (contentLength * 8) / (elapsedTime * 1000000); 
+        return speedMbps;
+      } else {
+        print('Failed to download file: ${response.statusCode}');
+        return 0.0;
+      }
+    } catch (e) {
+      print('Error during speed test: $e');
+      return 0.0;
+    }
+  } 
+
   Future<void> _startProxyServer() async {
     setState(() {
       _isConnecting = true;
@@ -133,6 +157,24 @@ class _MyHomePageState extends State<MyHomePage> {
 
   void _processData(List<int> data) async {
     try {
+        String command = String.fromCharCodes(data).trim();
+
+        if (command.startsWith('SPEED_TEST')) {
+          // Master sends SPEED_TEST command with the URL
+          String url = command.split(' ')[1];
+          print('Received speed test command. Testing URL: $url');
+
+          // Perform speed test
+          double speedMbps = await _performSpeedTest(url);
+          print('Speed test result: $speedMbps Mbps');
+
+          // Send result back to the master
+          Uint8List result = Uint8List.fromList('SPEED $speedMbps\n'.codeUnits);
+          _master_conn?.add(result);
+          await _master_conn?.flush();
+          return;
+        }
+
         switch (currentState) {
           case States.handshake:
             if (data.length < 2) return;
@@ -219,24 +261,6 @@ class _MyHomePageState extends State<MyHomePage> {
     } catch (e) {
       print('Error processing data: $e');
       _master_conn?.close();
-    }
-  }
-
-  // Perform the speed test
-  Future<void> _performSpeedTest(List<int> data) async {
-    _recvBytes += data.length;
-
-    if (_recvBytes >= _expectedDataSize && _checkTimer != null) {
-      final elapsedTime = _checkTimer!.elapsedMilliseconds / 1000; // Time in seconds
-      _checkTimer!.stop();
-      
-      print('Download completed. Total time: $elapsedTime seconds');
-
-      // Send the elapsed time back to the server
-      _sendSpeedAcknowledgment(elapsedTime);
-
-      _inCheckingSpeedStage = false;
-      _checkTimer = null;
     }
   }
 
