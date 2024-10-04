@@ -1,11 +1,16 @@
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
+// import 'package:http/http.dart' as http;
 import 'dart:io';
+import 'dart:typed_data';
 import 'socks5_server.dart';
 
 void main() {
   runApp(MyApp());
 }
+
+// Enum for address types
+enum Addr { v4, v6, domain }
+enum States { handshake, handling, proxying }
 
 class MyApp extends StatelessWidget {
   @override
@@ -22,13 +27,15 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  Socket? _primarySocket;
-  Socket? _secondarySocket;
+  Socket? _master_conn;
+  Socket? _dest_conn;
   bool _isConnected = false;
   bool _isConnecting = false;
   bool _isManualyStopped = false;
   int _retryAttempts = 0;
   String _connectionStatus = "";
+
+  States currentState = States.handshake;
 
   // Perform Internet speed test
   bool _inCheckingSpeedStage = false;
@@ -76,24 +83,22 @@ class _MyHomePageState extends State<MyHomePage> {
 
     final port = 8000;
     
-    final dataport = 8001;
-
     try {
-      _primarySocket = await Socket.connect(host, port);
-      print('Connected to primary socket: $host:$port');
+      _master_conn = await Socket.connect(host, port);
+      print('Connected to master node: $host:$port');
 
       setState(() {
         _isConnected = true;
         _isConnecting = false;
-        _connectionStatus = "Establishsed primary connection";
+        _connectionStatus = "Connected to master node, waiting for client requests...";
       });
 
-      _primarySocket!.listen(
+      _master_conn!.listen(
         (data) {
-          _handlePrimaryConnectionData(data, host, port, dataport);
+          _processData(data);
         },
         onDone: () {
-          print('Primary connection closed');
+          print('Master connection closed');
           setState(() {
             _isConnected = false;
             _isConnecting = false;
@@ -104,8 +109,9 @@ class _MyHomePageState extends State<MyHomePage> {
             _retryConnection();
         },
         onError: (error) {
-          print('Primary connection error: $error');
-          _primarySocket?.close();
+          print('Master connection error: $error');
+          _master_conn?.close();
+          _dest_conn?.destroy();
           setState(() {
             _isConnected = false;
             _isConnecting = false;
@@ -125,24 +131,94 @@ class _MyHomePageState extends State<MyHomePage> {
     return Future.value();
   }
 
-  void _handlePrimaryConnectionData(List<int> data, String host, int port, int dataport) async {
-    if (data.isNotEmpty) {
-      final receivedByte = data[0];
+  void _processData(List<int> data) async {
+    try {
+        switch (currentState) {
+          case States.handshake:
+            if (data.length < 2) return;
+            final version = data[0];
+            if (version != 5) return;
+            // Respond with method selection
+            Uint8List temp = Uint8List.fromList([5, 0]);
+            _master_conn?.add(temp); // SOCKS5 version and method (no authentication)
+            currentState = States.handling;
+            break;
 
-      if (receivedByte == 56 && !_inCheckingSpeedStage) {
-        _checkTimer = Stopwatch()..start();
-        _inCheckingSpeedStage = true;
-        _recvBytes = 0;
-      }
+          case States.handling:
+            if (data.length < 4) return;
+            final version = data[0];
+            if (version != 5) {
+              _master_conn?.close();
+              return;
+            }
 
-      if (_inCheckingSpeedStage == true) {
-        await _performSpeedTest(data);
-      } else {
-        if (receivedByte == 55) {
-          print('Received byte 55, initiating secondary connection');
-          _startSecondaryConnection(host, dataport);
-        }
+            final cmd = data[1];
+            if (cmd != 1) {
+              print('Unsupported command: $cmd');
+              _master_conn?.close();
+              return;
+            }
+            final reserved = data[2]; // Reserved byte
+            final addrType = data[3];
+
+            String address;
+            int port = 0;
+
+            switch (addrType) {
+              case 0x01: // IPv4
+                address = data.sublist(4, 8).join('.');
+                port = (data[8] << 8) | data[9];
+                break;
+              case 0x04: // IPv6
+                address = data.sublist(4, 20).map((b) => b.toRadixString(16)).join(':');
+                port = (data[20] << 8) | data[21];
+                break;
+              case 0x03: // Domain name
+                final domainLength = data[4];
+                address = String.fromCharCodes(data.sublist(5, 5 + domainLength));
+                port = (data[5 + domainLength] << 8) | data[6 + domainLength];
+                break;
+              default:
+                print('Unknown address type: $addrType');
+                _master_conn?.close();
+                return;
+            }
+
+            try {
+              _dest_conn = await Socket.connect(address, port, timeout: Duration(seconds: 5));
+              print('Client request RESOLVED: $address:$port');
+
+              // Reply: succeeded
+              _master_conn?.add(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+              await _master_conn?.flush();
+            } catch (e) {
+              print('Connection to $address:$port failed to resolve: $e');
+              _master_conn?.close();
+            }
+            currentState = States.proxying;
+
+            setState(() {
+              _connectionStatus = "Handling proxy stream data";
+            });
+
+            _dest_conn?.listen((data) {
+              _master_conn?.add(data);
+            }, onDone: () {
+              _dest_conn?.destroy();
+              setState(() {
+                _connectionStatus = "Waiting for client requests...";
+              });
+            });
+
+            break;
+
+          case States.proxying:
+            _dest_conn?.add(data);
+            break;
       }
+    } catch (e) {
+      print('Error processing data: $e');
+      _master_conn?.close();
     }
   }
 
@@ -166,36 +242,18 @@ class _MyHomePageState extends State<MyHomePage> {
 
   // Send speed acknowledgment to the server
   void _sendSpeedAcknowledgment(double elapsedTime) {
-    if (_primarySocket != null) {
+    if (_master_conn != null) {
       String timeMessage = elapsedTime.toStringAsFixed(2);
-      _primarySocket!.write(timeMessage);  // Send the time taken to the server
+      _master_conn!.write(timeMessage);  // Send the time taken to the server
       _inCheckingSpeedStage = false;
       print('Sent time acknowledgment to server: $timeMessage');
     }
   }
 
-  void _startSecondaryConnection(String host, int port) async {
-    try {
-      _secondarySocket = await Socket.connect(host, port);
-      print('Connected to $host:$port (Secondary Connection)');
-      setState(() {
-        _connectionStatus = "Establishsed data connection";
-      });
-      
-      Socks5ServerHandler obj = Socks5ServerHandler(_secondarySocket!);
-      obj.start();
-    } catch (e) {
-      print('Failed to connect to secondary channel: $e');
-      setState(() {
-        _connectionStatus = "Failed to establish secondary connection";
-      });
-    }
-  }
-
   // Stop proxy server and close connection
   void _stopProxyServer() {
-    if (_primarySocket != null) {
-      _primarySocket!.close();
+    if (_master_conn != null) {
+      _master_conn!.close();
       setState(() {
         _isConnected = false;
         _isManualyStopped = true;
@@ -207,8 +265,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
   @override
   void dispose() {
-    _primarySocket?.close();
-    _secondarySocket?.close();
+    _master_conn?.destroy();
+    _dest_conn?.destroy();
     super.dispose();
   }
 
