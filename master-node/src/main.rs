@@ -23,34 +23,35 @@ const KEEP_ALIVE_DURATION: u64 = 10;
 const MAX_BUF_SIZE: usize = 4096;
 
 struct ProxyManager {
-    round_robin_weight: Arc<AsyncMutex<RoundrobinWeight<String>>>,
+    // Slave IP Round Robin Weighted List
+    slave_ip_list_weighted: Arc<AsyncMutex<RoundrobinWeight<String>>>,
     // Slave IP to Stream
-    streams: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<TcpStream>>>>>,
-    // Session ID to Client Sender
-    clients: Arc<AsyncMutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    slave_streams: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<TcpStream>>>>>,
     // Slave IP to Client Count (Load)
     slave_load: Arc<AsyncMutex<HashMap<String, usize>>>,
     // Slave IP to flag indicating if slave io handler is running
     slave_is_running: Arc<AsyncMutex<HashMap<String, Arc<AtomicBool>>>>,
     // New field: Maps Slave IP to a list of session IDs
     slave_sessions: Arc<AsyncMutex<HashMap<String, Vec<u32>>>>,
+    // Session ID to Client Sender
+    clients: Arc<AsyncMutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl ProxyManager {
     fn new() -> Self {
         ProxyManager {
-            round_robin_weight: Arc::new(AsyncMutex::new(RoundrobinWeight::new())),
-            streams: Arc::new(AsyncMutex::new(HashMap::new())),
-            clients: Arc::new(AsyncMutex::new(HashMap::new())),
+            slave_ip_list_weighted: Arc::new(AsyncMutex::new(RoundrobinWeight::new())),
+            slave_streams: Arc::new(AsyncMutex::new(HashMap::new())),
             slave_load: Arc::new(AsyncMutex::new(HashMap::new())),
             slave_is_running: Arc::new(AsyncMutex::new(HashMap::new())),
             slave_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+            clients: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
     // Add weight for slave IP
     async fn add_weight(&self, ip: String, weight: isize) {
-        let mut g_sw = self.round_robin_weight.lock().await;
+        let mut g_sw = self.slave_ip_list_weighted.lock().await;
         let mut g_load = self.slave_load.lock().await;
         g_sw.add(ip.clone(), weight);
         // Initialize the load as 0
@@ -59,20 +60,20 @@ impl ProxyManager {
 
     // Insert a new stream for the slave IP
     async fn insert_stream(&self, ip: String, stream: TcpStream) {
-        let mut g_streams = self.streams.lock().await;
+        let mut g_streams = self.slave_streams.lock().await;
         g_streams.insert(ip, Arc::new(AsyncMutex::new(stream)));
     }
 
     // Get a stream by IP
     async fn get_stream(&self, ip: &String) -> Option<Arc<AsyncMutex<TcpStream>>> {
-        let g_streams = self.streams.lock().await;
+        let g_streams = self.slave_streams.lock().await;
         g_streams.get(ip).cloned()
     }
 
     // Get or assign a new slave IP based on session Id
     // Assign a client to a slave with the least load
     async fn get_matched_slave_ip(&self, session_id: u32) -> String {
-        let mut g_sw = self.round_robin_weight.lock().await;
+        let mut g_sw = self.slave_ip_list_weighted.lock().await;
         let mut g_load = self.slave_load.lock().await;
         let mut g_sessions = self.slave_sessions.lock().await;
 
@@ -457,7 +458,7 @@ async fn main() -> io::Result<()>  {
 			let session_id = rand::random::<u32>();
 
             let streams_available = {
-                let g_streams = proxy_manager.streams.lock().await;
+                let g_streams = proxy_manager.slave_streams.lock().await;
                 !g_streams.is_empty()
             };
 
