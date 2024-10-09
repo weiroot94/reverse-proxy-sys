@@ -2,15 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:io';
 import 'dart:typed_data';
-import 'socks5_server.dart';
+import 'socks5_session.dart';
 
 void main() {
   runApp(MyApp());
 }
-
-// Enum for address types
-enum Addr { v4, v6, domain }
-enum States { handshake, handling, proxying }
 
 class MyApp extends StatelessWidget {
   @override
@@ -155,6 +151,28 @@ class _MyHomePageState extends State<MyHomePage> {
     return Future.value();
   }
 
+  int _bytesToInt(List<int> bytes) {
+    return bytes.fold(0, (previousValue, element) => (previousValue << 8) + element);
+  }
+
+  List<int> _intToBytes(int value) {
+    return [
+      (value >> 24) & 0xFF,
+      (value >> 16) & 0xFF,
+      (value >> 8) & 0xFF,
+      value & 0xFF,
+    ];
+  }
+
+  void _sendToMasterInProtocol(int sessionId, List<int> data) {
+    List<int> header = _intToBytes(sessionId) + _intToBytes(data.length);
+    List<int> packet = header + data;
+
+    print('sessionId ${sessionId} SEND : ${data.length} bytes');
+
+    _master_conn?.add(packet);
+  }
+
   void _processData(List<int> data) async {
     try {
         String command = String.fromCharCodes(data).trim();
@@ -175,102 +193,53 @@ class _MyHomePageState extends State<MyHomePage> {
           return;
         }
 
-        switch (currentState) {
-          case States.handshake:
-            if (data.length < 2) return;
-            final version = data[0];
-            if (version != 5) return;
-            // Respond with method selection
-            Uint8List temp = Uint8List.fromList([5, 0]);
-            _master_conn?.add(temp); // SOCKS5 version and method (no authentication)
-            currentState = States.handling;
+        // Parse master-slave protocol
+        // Frame Structure:
+        // Session ID (4 bytes)
+        // Payload Length (4 bytes)
+        // Payload Data
+        int offset = 0;
+        while (offset < data.length) {
+          print('Received ${data.length} bytes from master');
+          // Parse the session ID and payload length
+          if (data.length - offset < 8) {
+            // Not enough data for header
             break;
+          }
 
-          case States.handling:
-            if (data.length < 4) return;
-            final version = data[0];
-            if (version != 5) {
-              _master_conn?.close();
-              return;
-            }
+          int sessionId = _bytesToInt(data.sublist(offset, offset + 4));
+          int payloadLength = _bytesToInt(data.sublist(offset + 4, offset + 8));
+          offset += 8;
 
-            final cmd = data[1];
-            if (cmd != 1) {
-              print('Unsupported command: $cmd');
-              _master_conn?.close();
-              return;
-            }
-            final reserved = data[2]; // Reserved byte
-            final addrType = data[3];
-
-            String address;
-            int port = 0;
-
-            switch (addrType) {
-              case 0x01: // IPv4
-                address = data.sublist(4, 8).join('.');
-                port = (data[8] << 8) | data[9];
-                break;
-              case 0x04: // IPv6
-                address = data.sublist(4, 20).map((b) => b.toRadixString(16)).join(':');
-                port = (data[20] << 8) | data[21];
-                break;
-              case 0x03: // Domain name
-                final domainLength = data[4];
-                address = String.fromCharCodes(data.sublist(5, 5 + domainLength));
-                port = (data[5 + domainLength] << 8) | data[6 + domainLength];
-                break;
-              default:
-                print('Unknown address type: $addrType');
-                _master_conn?.close();
-                return;
-            }
-
-            try {
-              _dest_conn = await Socket.connect(address, port, timeout: Duration(seconds: 5));
-              print('Client request RESOLVED: $address:$port');
-
-              // Reply: succeeded
-              _master_conn?.add(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
-              await _master_conn?.flush();
-            } catch (e) {
-              print('Connection to $address:$port failed to resolve: $e');
-              _master_conn?.close();
-            }
-            currentState = States.proxying;
-
-            setState(() {
-              _connectionStatus = "Handling proxy stream data";
-            });
-
-            _dest_conn?.listen((data) {
-              _master_conn?.add(data);
-            }, onDone: () {
-              _dest_conn?.destroy();
-              setState(() {
-                _connectionStatus = "Waiting for client requests...";
-              });
-            });
-
+          // Check if the entire payload is available
+          if (data.length - offset < payloadLength) {
+            // Not enough data for payload
+            print('sessionId ${sessionId} ERR PAYLOAD : ${payloadLength} bytes');
             break;
+          }
 
-          case States.proxying:
-            _dest_conn?.add(data);
-            break;
-      }
+          // Extract payload
+          List<int> payload = data.sublist(offset, offset + payloadLength);
+          offset += payloadLength;
+
+          print('sessionId ${sessionId} RECV: ${payloadLength} bytes');
+
+          // Handle the payload for the session
+          Socks5Session session;
+          if (sessions.containsKey(sessionId)) {
+            session = sessions[sessionId]!;
+          } else {
+            // Create a new session
+            session = Socks5Session(sessionId, _master_conn, _sendToMasterInProtocol);
+            sessions[sessionId] = session;
+          }
+
+          // Process the payload within the session
+          await session.processSocks5Data(payload);
+        }
     } catch (e) {
       print('Error processing data: $e');
       _master_conn?.close();
-    }
-  }
-
-  // Send speed acknowledgment to the server
-  void _sendSpeedAcknowledgment(double elapsedTime) {
-    if (_master_conn != null) {
-      String timeMessage = elapsedTime.toStringAsFixed(2);
-      _master_conn!.write(timeMessage);  // Send the time taken to the server
-      _inCheckingSpeedStage = false;
-      print('Sent time acknowledgment to server: $timeMessage');
     }
   }
 
@@ -298,7 +267,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Socket Proxy Example'),
+        title: Text('SOCKS5 Reverse'),
       ),
       body: Center(
         child: Column(

@@ -14,13 +14,26 @@ use utils::MAGIC_FLAG;
 use utils::MODULAS;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
+use tokio::sync::broadcast;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 const KEEP_ALIVE_DURATION: u64 = 10;
+const MAX_BUF_SIZE: usize = 4096;
 
 struct ProxyManager {
     round_robin_weight: Arc<AsyncMutex<RoundrobinWeight<String>>>,
+    // Slave IP to Stream
     streams: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<TcpStream>>>>>,
-    matches: Arc<AsyncMutex<HashMap<String, String>>>,
+    // Session ID to Client Sender
+    clients: Arc<AsyncMutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    // Slave IP to Client Count (Load)
+    slave_load: Arc<AsyncMutex<HashMap<String, usize>>>,
+    // Slave IP to flag indicating if slave io handler is running
+    slave_is_running: Arc<AsyncMutex<HashMap<String, Arc<AtomicBool>>>>,
+    // New field: Maps Slave IP to a list of session IDs
+    slave_sessions: Arc<AsyncMutex<HashMap<String, Vec<u32>>>>,
 }
 
 impl ProxyManager {
@@ -28,14 +41,20 @@ impl ProxyManager {
         ProxyManager {
             round_robin_weight: Arc::new(AsyncMutex::new(RoundrobinWeight::new())),
             streams: Arc::new(AsyncMutex::new(HashMap::new())),
-            matches: Arc::new(AsyncMutex::new(HashMap::new())),
+            clients: Arc::new(AsyncMutex::new(HashMap::new())),
+            slave_load: Arc::new(AsyncMutex::new(HashMap::new())),
+            slave_is_running: Arc::new(AsyncMutex::new(HashMap::new())),
+            slave_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
     // Add weight for slave IP
     async fn add_weight(&self, ip: String, weight: isize) {
         let mut g_sw = self.round_robin_weight.lock().await;
-        g_sw.add(ip, weight);
+        let mut g_load = self.slave_load.lock().await;
+        g_sw.add(ip.clone(), weight);
+        // Initialize the load as 0
+        g_load.insert(ip, 0);
     }
 
     // Insert a new stream for the slave IP
@@ -50,17 +69,66 @@ impl ProxyManager {
         g_streams.get(ip).cloned()
     }
 
-    // Get or assign a new slave IP based on the client IP
-    async fn get_or_assign_slave(&self, client_ip: String) -> String {
-        let mut g_matches = self.matches.lock().await;
-        match g_matches.get(&client_ip) {
-            Some(slave_ip) => slave_ip.clone(),
-            None => {
-                let mut g_sw = self.round_robin_weight.lock().await;
-                let slave_ip = g_sw.next().unwrap();
-                g_matches.insert(client_ip.clone(), slave_ip.clone());
-                slave_ip
-            }
+    // Get or assign a new slave IP based on session Id
+    // Assign a client to a slave with the least load
+    async fn get_matched_slave_ip(&self, session_id: u32) -> String {
+        let mut g_sw = self.round_robin_weight.lock().await;
+        let mut g_load = self.slave_load.lock().await;
+        let mut g_sessions = self.slave_sessions.lock().await;
+
+        let slave_ip = g_sw.next().unwrap();
+        g_load.entry(slave_ip.clone()).and_modify(|load| *load += 1);
+        
+        // Register the session ID to this slave
+        g_sessions.entry(slave_ip.clone()).or_default().push(session_id);
+    
+        slave_ip
+    }
+
+    // Register a client sender for the session ID
+    async fn register_client_sender(&self, session_id: u32, sender: mpsc::Sender<Vec<u8>>) {
+        let mut clients = self.clients.lock().await;
+        clients.insert(session_id, sender);
+    }
+
+    // Unregister a client sender and release the associated slave
+    async fn unregister_client_sender(&self, session_id: u32) {
+        let mut clients = self.clients.lock().await;
+        clients.remove(&session_id);
+    }
+
+    // Route data to the appropriate client using the session ID
+    async fn route_to_client(&self, session_id: u32, payload: Vec<u8>) {
+        let clients = self.clients.lock().await;
+        if let Some(sender) = clients.get(&session_id) {
+            let _ = sender.send(payload).await;
+        }
+    }
+
+    // Decrement load for a slave when a client disconnects
+    // async fn release_slave(&self, session_id: u32) {
+    //     let mut g_matches = self.matches.lock().await;
+    //     if let Some(slave_ip) = g_matches.remove(&session_id) {
+    //         let mut g_load = self.slave_load.lock().await;
+    //         g_load.entry(slave_ip).and_modify(|load| *load -= 1);
+    //     }
+    // }
+
+    // Function to check if the slave's I/O handler is already running
+    async fn is_slave_running(&self, slave_ip: &str) -> bool {
+        let g_running = self.slave_is_running.lock().await;
+        if let Some(is_running) = g_running.get(slave_ip) {
+            is_running.load(Ordering::Acquire)  // Check if I/O handler is running
+        } else {
+            false
+        }
+    }
+
+    // Function to set the slave's running status
+    async fn set_slave_running(&self, slave_ip: &str, running: bool) {
+        let g_running = self.slave_is_running.lock().await;
+        if let Some(is_running) = g_running.get(slave_ip) {
+            is_running.store(running, Ordering::Release);  // Set the running status
         }
     }
 }
@@ -71,6 +139,146 @@ fn usage(program: &str, opts: &Options) {
     let brief = format!("Usage: {} [-ltr] [IP_ADDRESS] [-s] [IP_ADDRESS]",
                         program_name);
     print!("{}", opts.usage(&brief));
+}
+
+// Utility function to convert bytes to an integer
+fn bytes_to_u32(bytes: &[u8]) -> u32 {
+    let mut array = [0u8; 4];
+    array.copy_from_slice(bytes);
+    u32::from_be_bytes(array)
+}
+
+// Utility function to convert an integer to bytes
+fn u32_to_bytes(value: u32) -> [u8; 4] {
+    value.to_be_bytes()
+}
+
+// Prepend the session ID and the payload length
+fn build_frame(session_id: u32, data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8 + data.len());
+    frame.extend_from_slice(&session_id.to_be_bytes()); // 4 bytes for session ID
+    frame.extend_from_slice(&(data.len() as u32).to_be_bytes()); // 4 bytes for payload length
+    frame.extend_from_slice(data); // actual data
+    frame
+}
+
+// Function to handle a single slave's I/O operations for all clients using it (multiplexing)
+async fn handle_slave_io(
+    slave_ip: String,
+    slave_stream_arc: Arc<AsyncMutex<TcpStream>>,
+    proxy_manager: Arc<ProxyManager>,
+    mut cli_broadcast_rx: broadcast::Receiver<(u32, Vec<u8>)>,
+) -> Result<(), std::io::Error> {
+    let mut slave_stream = slave_stream_arc.lock().await;
+    let mut session_id = 0;
+    let mut buffer = [0u8; MAX_BUF_SIZE];
+    let mut accumulated_buffer: Vec<u8> = Vec::new();
+    let mut header_read = false;
+    let mut expected_payload_len = 0;
+
+    loop {
+        tokio::select! {
+            // Handle incoming traffic from the slave
+            len = slave_stream.read(&mut buffer) => {
+                let len = len?;
+                if len == 0 {
+                    break;  // Slave connection closed
+                }
+
+                accumulated_buffer.extend_from_slice(&buffer[..len]);
+
+                // Process the incoming buffer
+                while accumulated_buffer.len() >= 8 {
+                    if !header_read && accumulated_buffer.len() >= 8 {
+                        session_id = bytes_to_u32(&accumulated_buffer[0..4]);
+                        expected_payload_len = u32::from_be_bytes([
+                            accumulated_buffer[4],
+                            accumulated_buffer[5],
+                            accumulated_buffer[6],
+                            accumulated_buffer[7],
+                        ]) as usize;
+                        header_read = true;
+                        accumulated_buffer.drain(0..8);  // Remove the header bytes
+                    }
+
+                    if header_read && accumulated_buffer.len() >= expected_payload_len {
+                        // Extract the payload and route to the correct client
+                        let payload = accumulated_buffer.drain(0..expected_payload_len).collect::<Vec<u8>>();
+                        log::info!("Slave -> Client: sid {}, size: {} bytes", session_id.clone(), expected_payload_len);
+                        proxy_manager.route_to_client(session_id, payload).await;
+
+                        header_read = false;
+                        expected_payload_len = 0;
+                    } else {
+                        break;  // Wait for more data
+                    }
+                }
+            }
+
+            // Handle traffic from clients (broadcast receiver)
+            Ok((client_session_id, client_data)) = cli_broadcast_rx.recv() => {
+                // Check if the session ID is associated with this slave
+                let g_sessions = proxy_manager.slave_sessions.lock().await;
+                if let Some(session_ids) = g_sessions.get(&slave_ip) {
+                    if session_ids.contains(&client_session_id) {
+                        log::info!("Client -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
+                        let frame = build_frame(client_session_id, &client_data);
+                        slave_stream.write_all(&frame).await?;
+                        slave_stream.flush().await?;
+                    } else {
+                        log::warn!("Client session ID {} is not associated with slave {}", client_session_id, slave_ip);
+                    }
+                }
+            }
+        }
+    }
+
+    // Mark the slave I/O as no longer running
+    proxy_manager.set_slave_running(&slave_ip, false);
+
+    Ok(())
+}
+
+// Function to handle traffic between a client and the slave
+async fn handle_client_io(
+    session_id: u32,
+    mut client_stream: TcpStream,
+    cli_broadcast_tx: broadcast::Sender<(u32, Vec<u8>)>,
+    proxy_manager: Arc<ProxyManager>,
+) -> Result<(), std::io::Error> {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
+
+    // Register the client's sender in the ProxyManager
+    proxy_manager.register_client_sender(session_id, tx).await;
+
+    let mut client_buffer = [0u8; MAX_BUF_SIZE];
+
+    // Main loop to handle continuous traffic between client and slave
+    loop {
+        tokio::select! {
+            // Read from client and send to slave via the mpsc channel
+            client_read = client_stream.read(&mut client_buffer) => {
+                let len = client_read?;
+                if len > 0 {
+                    log::info!("Broadcasting: sid {}, size: {} bytes", session_id.clone(), len);
+                    let _ = cli_broadcast_tx.send((session_id, client_buffer[..len].to_vec()));
+                } else {
+                    break;  // Client connection closed
+                }
+            },
+
+            // Read from the slave and send to client
+            Some(response) = rx.recv() => {
+                client_stream.write_all(&response).await?;
+                client_stream.flush().await?;
+            }
+        }
+    }
+
+    // Cleanup after the session ends
+    proxy_manager.unregister_client_sender(session_id).await;
+
+    Ok(())
 }
 
 // Send a command to the slave to download a file and report back the download speed
@@ -95,7 +303,7 @@ async fn send_speed_test_command(slave_stream: &mut TcpStream) -> Result<f64, Bo
     }
 }
 
-async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<ProxyManager>) -> Result<(), Box<dyn Error>> {
+async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Arc<ProxyManager>) -> Result<(), Box<dyn Error>> {
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
             Err(e) => {
@@ -109,7 +317,7 @@ async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<Prox
         raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
         let mut slave_stream = TcpStream::from_std(raw_stream).unwrap();
 
-        log::info!("Accepted slave from: {}:{}", slave_addr.ip(), slave_addr.port());
+        log::info!("New Slave {}:{}", slave_addr.ip(), slave_addr.port());
 
 		// Send a speed test request to the slave and measure the internet speed
         let download_speed_mbps = match send_speed_test_command(&mut slave_stream).await {
@@ -123,7 +331,7 @@ async fn handle_connections(slave_listener: TcpListener, proxy_manager: Arc<Prox
         // Assign weight based on measured download speed
         let weight = download_speed_mbps.round() as isize;
 
-        log::info!("Client {}'s weight: {}", slave_addr.ip(), weight);
+        log::info!("Slave {} Weight: {}", slave_addr.ip(), weight);
 
         proxy_manager.add_weight(slave_addr.ip().to_string(), weight).await;
         proxy_manager.insert_stream(slave_addr.ip().to_string(), slave_stream).await;
@@ -210,7 +418,7 @@ async fn main() -> io::Result<()>  {
             std::process::exit(1);
         });
 
-        log::info!("Listening on {} waiting for slave", master_addr);
+        log::info!("Waiting for Slave nodes on {}", master_addr);
 
         let slave_listener = match TcpListener::bind(&master_addr).await {
             Err(e) => {
@@ -220,17 +428,16 @@ async fn main() -> io::Result<()>  {
             Ok(p) => p,
         };
 
-        // Create a new thread
         tokio::spawn({
             let proxy_manager = Arc::clone(&proxy_manager);
             async move {
-                if let Err(e) = handle_connections(slave_listener, proxy_manager).await {
+                if let Err(e) = handle_slave_connections(slave_listener, proxy_manager).await {
                     log::error!("Connection handler error: {}", e);
                 }
             }
         });
 
-        log::info!("SOCKS5 server is listening on {}", socks_addr);
+        log::info!("Waiting for SOCKS5 clients on {}", socks_addr);
 
         let client_listener = match TcpListener::bind(&socks_addr).await {
             Err(e) => {
@@ -240,9 +447,14 @@ async fn main() -> io::Result<()>  {
             Ok(p) => p,
         };
 
+        let (cli_broadcast_tx, cli_broadcast_rx) = broadcast::channel::<(u32, Vec<u8>)>(100);
+
         loop {
             let (client_stream, client_addr) = client_listener.accept().await.unwrap();
-            log::info!("Accepted connection from client: {}", client_addr.ip());
+            log::info!("New Client: {}", client_addr.ip());
+
+			// Generate a new session ID for this client
+			let session_id = rand::random::<u32>();
 
             let streams_available = {
                 let g_streams = proxy_manager.streams.lock().await;
@@ -256,55 +468,30 @@ async fn main() -> io::Result<()>  {
 
             let raw_stream = client_stream.into_std().unwrap();
             raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
-            let mut client_stream = TcpStream::from_std(raw_stream).unwrap();
+            let client_stream = TcpStream::from_std(raw_stream).unwrap();
+
+            // Subscribe to the broadcast channel for the slave
+            let cli_broadcast_rx_clone = cli_broadcast_rx.resubscribe();
 
             // Get or assign a corresponding slave node for the current client using ProxyManager
-            let selected_slave_ip = proxy_manager.get_or_assign_slave(client_addr.ip().to_string()).await;
+            let selected_slave_ip = proxy_manager.get_matched_slave_ip(session_id).await;
 
-            // Retrieve the stream corresponding to the selected slave IP
+            // Spawn a task to handle traffic between the client and the assigned slave
             if let Some(slave_stream_arc) = proxy_manager.get_stream(&selected_slave_ip).await {
-                log::info!("Found TcpStream for IP: {}", selected_slave_ip);
-				let slave_stream_arc_clone = Arc::clone(&slave_stream_arc);
+                let proxy_manager_clone = Arc::clone(&proxy_manager);
+                let slave_stream_arc_clone = Arc::clone(&slave_stream_arc);
 
-                // Spawn a task to handle the proxying between the client and the slave
-                tokio::spawn(async move {
-					let mut slave_stream = slave_stream_arc_clone.lock().await;
-                    let mut buf1 = [0u8; 1024];
-                    let mut buf2 = [0u8; 1024];
+                tokio::spawn(handle_client_io(session_id, client_stream, cli_broadcast_tx.clone(), proxy_manager_clone.clone()));
 
-                    loop {
-                        tokio::select! {
-                            a = slave_stream.read(&mut buf1) => {
-                                let len = match a {
-                                    Err(_) => break,
-                                    Ok(p) => p
-                                };
-                                if len == 0 {
-                                    break;
-                                }
-                                if let Err(e) = client_stream.write_all(&buf1[..len]).await {
-                                    log::error!("Write error: {}", e);
-                                    break;
-                                }
-                            },
-                            b = client_stream.read(&mut buf2) => {
-                                let len = match b {
-                                    Err(_) => break,
-                                    Ok(p) => p
-                                };
-                                if len == 0 {
-                                    break;
-                                }
-                                if let Err(e) = slave_stream.write_all(&buf2[..len]).await {
-                                    log::error!("Write error: {}", e);
-                                    break;
-                                }
-                            },
-                        }
-                    }
-                });
+                if !proxy_manager.is_slave_running(&selected_slave_ip).await {
+                    // Set the slave as running
+                    proxy_manager.set_slave_running(&selected_slave_ip, true).await;
+
+                    // Spawn only once per slave for slave -> client traffic
+                    tokio::spawn(handle_slave_io(selected_slave_ip.clone(), slave_stream_arc_clone, proxy_manager_clone, cli_broadcast_rx_clone));
+                }
             } else {
-                log::warn!("TcpStream for selected slave IP not found.");
+                log::warn!("No available slave for client");
             }
         }
     } else if matches.opt_count("r") > 0 {
