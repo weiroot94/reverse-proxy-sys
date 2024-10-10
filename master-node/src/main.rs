@@ -82,6 +82,9 @@ struct ProxyManager {
     // Broadcast channel from client to slaves
     broadcast_tx: broadcast::Sender<(u32, Vec<u8>)>,
     broadcast_rx: broadcast::Receiver<(u32, Vec<u8>)>,
+
+    // Map client IP addresses to slave IPs in mode 1
+    ip_to_slave_map: Arc<AsyncMutex<HashMap<String, String>>>,
 }
 
 impl ProxyManager {
@@ -94,12 +97,22 @@ impl ProxyManager {
             clients: Arc::new(AsyncMutex::new(HashMap::new())),
             broadcast_tx,
             broadcast_rx,
+            ip_to_slave_map: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
     // Get an available slave stream using weighted round-robin
-    async fn get_available_slave_ip(&self) -> Option<String> {
+    async fn get_available_slave_ip(&self, client_ip: String) -> Option<String> {
+        let mut ip_to_slave_map = self.ip_to_slave_map.lock().await;
         let slave_list = self.slaves.lock().await;
+
+        // Mode 1: Assign the same slave to clients from the same IP
+        if self.client_assign_mode == 1 {
+            // Mode 1: Assign the same slave to clients from the same IP
+            if let Some(slave_ip) = ip_to_slave_map.get(&client_ip) {
+                return Some(slave_ip.clone());
+            }
+        }
 
         let available_slaves: Vec<_> = slave_list.iter()
             .filter_map(|(ip, slave)| {
@@ -130,6 +143,11 @@ impl ProxyManager {
         for (ip, weight) in available_slaves {
             cumulative_weight += weight;
             if cumulative_weight >= random_weight {
+                // If in Mode 1, store this slave for the client IP
+                if self.client_assign_mode == 1 {
+                    ip_to_slave_map.insert(client_ip.clone(), ip.to_string());
+                }
+
                 return Some(ip.to_string());
             }
         }
@@ -540,7 +558,8 @@ async fn main() -> io::Result<()>  {
 			let session_id = rand::random::<u32>();
 
             // Retrieve an available slave stream
-            if let Some(slave_ip) = proxy_manager.get_available_slave_ip().await {
+            let client_ip = client_addr.ip().to_string();
+            if let Some(slave_ip) = proxy_manager.get_available_slave_ip(client_ip).await {
                 // Lock the incoming client stream
                 let raw_stream = client_stream.into_std().unwrap();
                 raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
