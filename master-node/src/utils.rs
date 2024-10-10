@@ -1,4 +1,4 @@
-pub static MAGIC_FLAG : [u8;3] = [0x37, 0x38];
+pub static MAGIC_FLAG : [u8;2] = [0x37, 0x38];
 pub static MODULAS : isize = 6;
 
 pub fn makeword(a : u8, b : u8) -> u16{
