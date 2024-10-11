@@ -494,62 +494,76 @@ async fn main() -> io::Result<()>  {
     let args: Vec<String> = std::env::args().collect();
     let program = args[0].clone();
 
-    // Global store of proxy system
-    let proxy_manager = Arc::new(ProxyManager::new());
-
     let mut opts = Options::new();
-
-    opts.optopt("l",
-                "bind",
-                "The address on which to listen socks5 server for incoming requests",
-                "BIND_ADDR");
 
     opts.optopt("t",
                 "transfer",
                 "The address accept from slave socks5 server connection",
-                "TRANSFER_ADDRESS");
-    opts.optopt("r",
-                "reverse",
-                "reverse socks5 server connect to master",
                 "TRANSFER_ADDRESS");
 
     opts.optopt("s",
                 "server",
                 "The address on which to listen local socks5 server",
                 "TRANSFER_ADDRESS");
+    
+    opts.optopt("p",
+                "proxy_mode",
+                "Set the proxy mode: stick (1) or nonstick (2)",
+                "MODE");
+    
+    opts.optopt("r",
+                "slave_recovery",
+                "Set the slave recovery mode: wait (1) or reconnect (2). Only available when proxy_mode=stick",
+                "MODE");
 
     let matches = opts.parse(&args[1..]).unwrap_or_else(|_| {
         usage(&program, &opts);
         std::process::exit(-1);
     });
 
-    if matches.opt_count("l") > 0{
-        let local_address: String = matches.opt_str("l").unwrap_or_else(|| {
-            log::error!("Not found listen port. eg: net-relay -l 0.0.0.0:8000");
-            std::process::exit(1);
-        });
-        log::info!("Listening on: {}", local_address);
-
-        let listener = match TcpListener::bind(&local_address).await {
-            Err(e) => {
-                log::error!("Error: {}", e);
-                return Ok(());
-            }
-            Ok(p) => p,
-        };
-
-        loop {
-            let (stream, addr) = listener.accept().await.unwrap();
-            log::info!("Accepted from: {}", addr);
-            let raw_stream = stream.into_std().unwrap();
-            raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
-            let stream = TcpStream::from_std(raw_stream).unwrap();
-
-            tokio::spawn(async {
-                socks::socksv5_handle(stream).await;
-            });
+    // Parse proxy_mode (stick or nonstick)
+    let proxy_mode: String = matches.opt_str("p").unwrap_or_else(|| "stick".to_string());
+    let client_assign_mode: u8 = match proxy_mode.as_str() {
+        "stick" => 1,
+        "nonstick" => 2,
+        _ => {
+            log::error!("Invalid proxy mode. Using default (stick).");
+            1
         }
-    } else if matches.opt_count("t") > 0 {
+    };
+
+    // Parse slave_recovery (wait or reconnect) only if proxy_mode is stick
+    let slave_recovery_mode: u8 = if client_assign_mode == 1 {
+        matches.opt_str("r")
+            .unwrap_or_else(|| "wait".to_string())
+            .parse::<String>()
+            .map(|recovery_mode| match recovery_mode.as_str() {
+                "wait" => 1,
+                "reconnect" => 2,
+                _ => {
+                    log::error!("Invalid slave recovery mode. Using default (wait).");
+                    1
+                }
+            })
+            .unwrap_or(1)
+    } else {
+        // For nonstick mode, we don't handle slave_recovery
+        log::info!("Slave recovery is ignored in nonstick mode.");
+        0 // Use 0 to signify that slave recovery isn't relevant in nonstick mode
+    };
+
+    // Global store of proxy system
+    let proxy_manager = Arc::new(ProxyManager {
+        client_assign_mode,
+        slave_recovery_mode,
+        slaves: Arc::new(AsyncMutex::new(HashMap::new())),
+        clients: Arc::new(AsyncMutex::new(HashMap::new())),
+        broadcast_tx: broadcast::channel(100).0,
+        broadcast_rx: broadcast::channel(100).1,
+        cli_ip_to_slave: Arc::new(AsyncMutex::new(HashMap::new())),
+    });
+
+    if matches.opt_count("t") > 0 {
         let master_addr: String = matches.opt_str("t").unwrap_or_else(|| {
             log::error!("Not found listen port. eg: net-relay -t 0.0.0.0:8000 -s 0.0.0.0:1080");
             std::process::exit(1);
@@ -625,38 +639,6 @@ async fn main() -> io::Result<()>  {
                 tokio::spawn(handle_client_io(session_id, proxy_manager_clone));
             } else {
                 log::warn!("No available slave for client with session ID {}", session_id);
-            }
-        }
-    } else if matches.opt_count("r") > 0 {
-        let fulladdr: String = matches.opt_str("r").unwrap_or_else(|| {
-            log::error!("Not found IP. eg: net-relay -r 192.168.0.1:8000");
-            std::process::exit(1);
-        });
-
-        let master_stream = TcpStream::connect(fulladdr.clone()).await?;
-
-        let raw_stream = master_stream.into_std().unwrap();
-        raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
-        let mut master_stream = TcpStream::from_std(raw_stream).unwrap();
-
-        log::info!("Connected to {}", fulladdr);
-        loop {
-            let mut buf = [0u8; 1];
-            if let Err(e) = master_stream.read_exact(&mut buf).await {
-                log::error!("Error: {}", e);
-                return Ok(());
-            }
-
-            if buf[0] == MAGIC_FLAG[0] {
-                let stream = TcpStream::connect(fulladdr.clone()).await?;
-
-                let raw_stream = stream.into_std().unwrap();
-                raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
-                let stream = TcpStream::from_std(raw_stream).unwrap();
-
-                task::spawn(async {
-                    socks::socksv5_handle(stream).await;
-                });
             }
         }
     } else {
