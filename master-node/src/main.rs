@@ -85,7 +85,7 @@ struct ProxyManager {
     broadcast_rx: broadcast::Receiver<(u32, Vec<u8>)>,
 
     // Map client IP addresses to slave IPs in Client Assignment Mode 1
-    ip_to_slave_map: Arc<AsyncMutex<HashMap<String, String>>>,
+    cli_ip_to_slave: Arc<AsyncMutex<HashMap<String, String>>>,
 }
 
 impl ProxyManager {
@@ -93,24 +93,24 @@ impl ProxyManager {
         let (broadcast_tx, broadcast_rx) = broadcast::channel(100);
         Self {
             client_assign_mode: 1,
-            slave_recovery_mode: 1,
+            slave_recovery_mode: 2,
             slaves: Arc::new(AsyncMutex::new(HashMap::new())),
             clients: Arc::new(AsyncMutex::new(HashMap::new())),
             broadcast_tx,
             broadcast_rx,
-            ip_to_slave_map: Arc::new(AsyncMutex::new(HashMap::new())),
+            cli_ip_to_slave: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
     // Get an available slave stream using weighted round-robin
     async fn get_available_slave_ip(&self, client_ip: &String) -> Option<String> {
-        let mut ip_to_slave_map = self.ip_to_slave_map.lock().await;
+        let mut cli_ip_to_slave = self.cli_ip_to_slave.lock().await;
         let slave_list = self.slaves.lock().await;
 
         // Mode 1: Assign the same slave to clients from the same IP
         if self.client_assign_mode == 1 {
             // Mode 1: Assign the same slave to clients from the same IP
-            if let Some(slave_ip) = ip_to_slave_map.get(client_ip) {
+            if let Some(slave_ip) = cli_ip_to_slave.get(client_ip) {
                 return Some(slave_ip.clone());
             }
         }
@@ -146,7 +146,7 @@ impl ProxyManager {
             if cumulative_weight >= random_weight {
                 // If in Mode 1, store this slave for the client IP
                 if self.client_assign_mode == 1 {
-                    ip_to_slave_map.insert(client_ip.clone(), ip.to_string());
+                    cli_ip_to_slave.insert(client_ip.clone(), ip.to_string());
                 }
 
                 return Some(ip.to_string());
@@ -190,7 +190,7 @@ impl ProxyManager {
 
     // Assign a slave to the client
     async fn assign_slave_to_client(&self, client_ip: String, slave_ip: String, session_id: u32) {
-        let mut ip_map = self.ip_to_slave_map.lock().await;
+        let mut ip_map = self.cli_ip_to_slave.lock().await;
         ip_map.insert(client_ip.clone(), slave_ip.clone());
 
         self.add_session_to_slave(&slave_ip, session_id).await;
@@ -203,45 +203,28 @@ impl ProxyManager {
             // In this mode, we simply wait for the slave to reconnect
             // Recovery logic should be handled in the connection loop
         } else if self.slave_recovery_mode == 2 {
-            log::info!("Reassigning clients from disconnected slave {}", slave_ip);
+            let mut slaves = self.slaves.lock().await;
 
-            // Gather all clients connected to this slave
-            let clients_to_reassign = {
-                let slaves = self.slaves.lock().await;
-                if let Some(slave) = slaves.get(slave_ip) {
-                    let cli_sids = slave.cli_sids.lock().await;
-                    cli_sids.clone()
-                } else {
-                    Vec::new()
-                }
-            };
-
-            // Reassign each client to another available slave
-            for session_id in clients_to_reassign {
-                let client = {
-                    let clients = self.clients.lock().await;
-                    clients.get(&session_id).cloned()
-                };
-
-                if let Some(client) = client {
-                    let client_ip = client.ip_addr;
-                    if let Some(new_slave_ip) = self.get_available_slave_ip(&client_ip).await {
-                        log::info!(
-                            "Reassigning session {} from {} to {}",
-                            session_id,
-                            slave_ip,
-                            new_slave_ip
-                        );
-                        self.assign_slave_to_client(client_ip, new_slave_ip, session_id)
-                            .await;
-                    } else {
-                        log::warn!(
-                            "No available slave for reassigning session {} after disconnection",
-                            session_id
-                        );
-                    }
-                }
+            if slaves.remove(slave_ip).is_some() {
+                log::info!("Removed disconnected slave: {}", slave_ip);
+            } else {
+                log::warn!("Attempted to remove non-existent slave: {}", slave_ip);
+                return;
             }
+
+            let mut ip_to_slave_map = self.cli_ip_to_slave.lock().await;
+
+            // Remove all IPs that were mapped to the disconnected slave
+            ip_to_slave_map.retain(|_, mapped_slave_ip| {
+                if mapped_slave_ip == slave_ip {
+                    log::info!("Removing IP mapped to disconnected slave: {}", slave_ip);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            log::info!("Slave {} disconnected. Clients will be assigned to new slaves on new connections.", slave_ip);
         }
     }
 }
@@ -352,9 +335,11 @@ async fn handle_slave_io(
         }
     }
 
-    log::warn!("Handling disconnection for slave {}", slave.ip_addr);
-    proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
-
+    // Slave recovery is only available when proxy stick mode
+    if proxy_manager.client_assign_mode == 1 {
+        proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
+    }
+    
     Ok(())
 }
 
