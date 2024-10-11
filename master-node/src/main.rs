@@ -115,10 +115,12 @@ impl ProxyManager {
             }
         }
 
+        let mut total_weight = 0.0;
         let available_slaves: Vec<_> = slave_list.iter()
             .filter_map(|(ip, slave)| {
-                let weight = slave.net_speed; // Use net_speed as weight
+                let weight = slave.net_speed;
                 if weight > 0.0 {
+                    total_weight += weight;
                     Some((ip, weight))
                 } else {
                     None
@@ -130,26 +132,17 @@ impl ProxyManager {
             return None;
         }
 
-        // If there's only one available slave, return it
-        if available_slaves.len() == 1 {
-            let (ip, _) = &available_slaves[0];
-            return Some(ip.to_string());
-        }
-
-        let total_weight: f64 = available_slaves.iter().map(|(_, weight)| *weight).sum();
-        let random_weight: f64 = rand::random::<f64>() * total_weight;
-        let mut cumulative_weight = 0.0;
-
-        // Select a slave based on weighted random selection
-        for (ip, weight) in available_slaves {
-            cumulative_weight += weight;
-            if cumulative_weight >= random_weight {
-                // If in Mode 1, store this slave for the client IP
-                if self.client_assign_mode == 1 {
-                    cli_ip_to_slave.insert(client_ip.clone(), ip.to_string());
+        // Weighted round-robin selection
+        if total_weight > 0.0 {
+            let mut random_weight: f64 = rand::random::<f64>() * total_weight;
+            for (ip, weight) in available_slaves {
+                if random_weight < weight {
+                    if self.client_assign_mode == 1 {
+                        cli_ip_to_slave.insert(client_ip.clone(), ip.to_string());
+                    }
+                    return Some(ip.to_string());
                 }
-
-                return Some(ip.to_string());
+                random_weight -= weight;
             }
         }
 
@@ -175,7 +168,7 @@ impl ProxyManager {
         if let Some(slave) = self.slaves.lock().await.get(slave_ip) {
             slave.add_client_session(session_id).await;
         } else {
-            log::warn!("No slave found for IP: {}", slave_ip);
+            log::warn!("Slave {} is not alive yet", slave_ip);
         }
     }
 
@@ -188,21 +181,9 @@ impl ProxyManager {
         }
     }
 
-    // Assign a slave to the client
-    async fn assign_slave_to_client(&self, client_ip: String, slave_ip: String, session_id: u32) {
-        let mut ip_map = self.cli_ip_to_slave.lock().await;
-        ip_map.insert(client_ip.clone(), slave_ip.clone());
-
-        self.add_session_to_slave(&slave_ip, session_id).await;
-    }
-
     // Handle slave disconnection based on slave_recovery_mode
     async fn handle_slave_disconnection(&self, slave_ip: &str) {
-        if self.slave_recovery_mode == 1 {
-            log::info!("Waiting for slave {} to recover", slave_ip);
-            // In this mode, we simply wait for the slave to reconnect
-            // Recovery logic should be handled in the connection loop
-        } else if self.slave_recovery_mode == 2 {
+        {
             let mut slaves = self.slaves.lock().await;
 
             if slaves.remove(slave_ip).is_some() {
@@ -211,7 +192,13 @@ impl ProxyManager {
                 log::warn!("Attempted to remove non-existent slave: {}", slave_ip);
                 return;
             }
+        }
 
+        if self.slave_recovery_mode == 1 {
+            log::info!("Waiting for slave {} to recover", slave_ip);
+            // In this mode, we simply wait for the slave to reconnect
+            // Recovery logic should be handled in the connection loop
+        } else if self.slave_recovery_mode == 2 {
             let mut ip_to_slave_map = self.cli_ip_to_slave.lock().await;
 
             // Remove all IPs that were mapped to the disconnected slave
@@ -223,9 +210,9 @@ impl ProxyManager {
                     true
                 }
             });
-
-            log::info!("Slave {} disconnected. Clients will be assigned to new slaves on new connections.", slave_ip);
         }
+
+        log::info!("Slave {} disconnected", slave_ip);
     }
 }
 
@@ -258,12 +245,31 @@ fn build_frame(session_id: u32, data: &[u8]) -> Vec<u8> {
     frame
 }
 
+// Helper function to read from the slave stream
+async fn read_from_slave(
+    slave: &Slave,
+    buffer: &mut [u8]
+) -> Result<usize, std::io::Error> {
+    let mut slave_stream = slave.stream.lock().await;
+    slave_stream.read(buffer).await
+}
+
+// Helper function to write to the slave stream
+async fn write_to_slave(
+    slave: &Slave,
+    frame: &[u8]
+) -> Result<(), std::io::Error> {
+    let mut slave_stream = slave.stream.lock().await;
+    slave_stream.write_all(frame).await?;
+    slave_stream.flush().await
+}
+
+
 // Function to handle a single slave's I/O operations for all clients using it (multiplexing)
 async fn handle_slave_io(
     slave: Slave,
     proxy_manager: Arc<ProxyManager>,
 ) -> Result<(), std::io::Error> {
-    let mut slave_stream = slave.stream.lock().await;
     let mut session_id = 0;
     let mut buffer = [0u8; MAX_BUF_SIZE];
     let mut accumulated_buffer: Vec<u8> = Vec::new();
@@ -276,7 +282,7 @@ async fn handle_slave_io(
     loop {
         tokio::select! {
             // Handle incoming traffic from the slave
-            len = slave_stream.read(&mut buffer) => {
+            len = read_from_slave(&slave, &mut buffer) => {
                 let len = len?;
                 if len == 0 {
                     break;  // Slave connection closed
@@ -321,15 +327,7 @@ async fn handle_slave_io(
                     let frame = build_frame(client_session_id, &client_data);
 
                     // Write the frame to the slave stream
-                    match slave_stream.write_all(&frame).await {
-                        Ok(_) => {
-                            log::info!("Successfully wrote frame to slave: sid {}", client_session_id);
-                        }
-                        Err(e) => {
-                            log::error!("Failed to write frame to slave: sid {}, error: {}", client_session_id, e);
-                        }
-                    }
-                    slave_stream.flush().await?;
+                    write_to_slave(&slave, &frame).await?;
                 }
             }
         }
@@ -393,8 +391,6 @@ async fn handle_client_io(
     {
         let mut clients = proxy_manager.clients.lock().await;
         if let Some(client) = clients.remove(&session_id) {
-            log::info!("Removed client session ID {} from ProxyManager.", session_id);
-    
             // Remove the session ID from the associated slave541
             if let Some(selected_slave_ip) = client.selected_slave_ip {
                 proxy_manager.remove_session_from_slave(&selected_slave_ip, session_id).await;
@@ -553,13 +549,14 @@ async fn main() -> io::Result<()>  {
     };
 
     // Global store of proxy system
+    let (broadcast_tx, broadcast_rx) = broadcast::channel(100);
     let proxy_manager = Arc::new(ProxyManager {
         client_assign_mode,
         slave_recovery_mode,
         slaves: Arc::new(AsyncMutex::new(HashMap::new())),
         clients: Arc::new(AsyncMutex::new(HashMap::new())),
-        broadcast_tx: broadcast::channel(100).0,
-        broadcast_rx: broadcast::channel(100).1,
+        broadcast_tx,
+        broadcast_rx,
         cli_ip_to_slave: Arc::new(AsyncMutex::new(HashMap::new())),
     });
 
