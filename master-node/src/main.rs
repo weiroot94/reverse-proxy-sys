@@ -535,13 +535,13 @@ async fn main() -> io::Result<()>  {
     // Parse slave_recovery (wait or reconnect) only if proxy_mode is stick
     let slave_recovery_mode: u8 = if client_assign_mode == 1 {
         matches.opt_str("r")
-            .unwrap_or_else(|| "wait".to_string())
+            .unwrap_or_else(|| "reconnect".to_string())
             .parse::<String>()
             .map(|recovery_mode| match recovery_mode.as_str() {
                 "wait" => 1,
                 "reconnect" => 2,
                 _ => {
-                    log::error!("Invalid slave recovery mode. Using default (wait).");
+                    log::error!("Invalid slave recovery mode. Using default (reconnect).");
                     1
                 }
             })
