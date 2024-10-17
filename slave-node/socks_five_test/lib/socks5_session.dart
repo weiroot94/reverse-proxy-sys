@@ -88,7 +88,6 @@ class Socks5Session {
 
             try {
               _dest_conn = await Socket.connect(address, port, timeout: Duration(seconds: 5));
-              print('SOCKS5 RESOLVE $address:$port');
 
               // Reply: succeeded
               _sendData(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));

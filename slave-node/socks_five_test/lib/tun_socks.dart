@@ -1,0 +1,217 @@
+import 'dart:io';
+import 'package:logging/logging.dart';
+import 'package:http/http.dart' as http;
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'socks5_session.dart';
+
+enum ProxyState {
+  disconnected,
+  connecting,
+  connected,
+  manuallyStopped,
+}
+
+class TunSocks {
+  final String host;
+  final int port;
+  late Socket? _masterConn;
+  late Socket? _destConn;
+
+  ProxyState currentState = ProxyState.disconnected;
+  int retryAttempts = 0;
+
+  final Function(String) logCallback;
+  final Function(bool) connectionStatusCallback;
+
+  TunSocks({
+    required this.host,
+    required this.port,
+    required this.logCallback,
+    required this.connectionStatusCallback,
+  });
+
+  Future<void> startTunnel() async {
+    if (currentState == ProxyState.connecting || currentState == ProxyState.connected) {
+      return;
+    }
+
+    currentState = ProxyState.connecting;
+    logCallback('Connecting to master node...');
+    connectionStatusCallback(false);
+
+    try {
+      _masterConn = await Socket.connect(host, port);
+      logCallback('Connected to master node: $host:$port');
+
+      currentState = ProxyState.connected;
+      connectionStatusCallback(true);
+
+      _masterConn!.listen(
+        (data) {
+          _processData(data);
+        },
+        onDone: () {
+          logCallback('Master connection closed');
+          currentState = ProxyState.disconnected;
+          connectionStatusCallback(false);
+
+          if (currentState != ProxyState.manuallyStopped) {
+            _retryConnection();
+          }
+        },
+        onError: (error) {
+          logCallback('Master connection error: $error');
+          _cleanupConnections();
+          connectionStatusCallback(false);
+          _retryConnection();
+        },
+      );
+    } catch (e) {
+      logCallback('Failed to connect to master: $e');
+      currentState = ProxyState.disconnected;
+      connectionStatusCallback(false);
+      _retryConnection();
+    }
+  }
+
+  Future<void> _retryConnection() async {
+    if (retryAttempts % 5 != 0 || retryAttempts == 0) {
+      Future.delayed(Duration(seconds: 5), () {
+        retryAttempts++;
+        logCallback('Retrying connection... Attempt $retryAttempts');
+        startTunnel();
+      });
+    } else {
+      Future.delayed(Duration(minutes: 1), () {
+        retryAttempts++;
+        logCallback('Resuming retries after 1 minute. Attempt $retryAttempts');
+        startTunnel();
+      });
+    }
+  }
+
+  void _processData(List<int> data) async {
+    try {
+        // Process data based on received commands
+        String command = String.fromCharCodes(data).trim();
+        if (command.startsWith('SPEED_TEST')) {
+            String url = command.split(' ')[1];
+            double speedMbps = await _performSpeedTest(url);
+
+            logCallback('Speed test result: $speedMbps Mbps');
+
+            // Send result back to the master
+            Uint8List result = Uint8List.fromList('SPEED $speedMbps\n'.codeUnits);
+            _masterConn?.add(result);
+            await _masterConn?.flush();
+            return;
+        }
+
+        // Parse master-slave protocol
+        // Frame Structure:
+        // Session ID (4 bytes)
+        // Payload Length (4 bytes)
+        // Payload Data
+        int offset = 0;
+        while (offset < data.length) {
+            // Parse the session ID and payload length
+            if (data.length - offset < 8) {
+            // Not enough data for header
+            break;
+            }
+
+            int sessionId = _bytesToInt(data.sublist(offset, offset + 4));
+            int payloadLength = _bytesToInt(data.sublist(offset + 4, offset + 8));
+            offset += 8;
+
+            // Check if the entire payload is available
+            if (data.length - offset < payloadLength) {
+                // Not enough data for payload
+                logCallback('sessionId ${sessionId} ERR PAYLOAD : ${payloadLength} bytes');
+                break;
+            }
+
+            // Extract payload
+            List<int> payload = data.sublist(offset, offset + payloadLength);
+            offset += payloadLength;
+
+            // Handle the payload for the session
+            Socks5Session session;
+            if (sessions.containsKey(sessionId)) {
+            session = sessions[sessionId]!;
+            } else {
+            // Create a new session
+            session = Socks5Session(sessionId, _masterConn, _sendToMasterInProtocol);
+            sessions[sessionId] = session;
+            }
+
+            // Process the payload within the session
+            await session.processSocks5Data(payload);
+        }
+    } catch (e) {
+      logCallback('Error processing data: $e');
+      _cleanupConnections();
+    }
+  }
+
+  Future<double> _performSpeedTest(String url) async {
+    final stopwatch = Stopwatch()..start();
+
+    try {
+      final response = await http.get(Uri.parse(url));
+      stopwatch.stop();
+
+      if (response.statusCode == 200) {
+        final contentLength = response.contentLength ?? 0;
+        final elapsedTime = stopwatch.elapsedMilliseconds / 1000; // in seconds
+
+        // Calculate speed in Mbps
+        final speedMbps = (contentLength * 8) / (elapsedTime * 1000000); 
+        return speedMbps;
+      } else {
+        print('Failed to test url: ${response.statusCode}');
+        return 0.0;
+      }
+    } catch (e) {
+      print('Error during speed test: $e');
+      return 0.0;
+    }
+  }
+
+  int _bytesToInt(List<int> bytes) {
+    return bytes.fold(0, (previousValue, element) => (previousValue << 8) + element);
+  }
+
+  List<int> _intToBytes(int value) {
+    return [
+      (value >> 24) & 0xFF,
+      (value >> 16) & 0xFF,
+      (value >> 8) & 0xFF,
+      value & 0xFF,
+    ];
+  }
+
+  void _sendToMasterInProtocol(int sessionId, List<int> data) {
+    List<int> header = _intToBytes(sessionId) + _intToBytes(data.length);
+    List<int> packet = header + data;
+
+    _masterConn?.add(packet);
+  }
+
+  void stopTunnel() {
+    currentState = ProxyState.manuallyStopped;
+    _cleanupConnections();
+    connectionStatusCallback(false);
+    logCallback('Proxy server stopped.');
+  }
+
+  void _cleanupConnections() {
+    _masterConn?.close();
+    _destConn?.destroy();
+    _masterConn = null;
+    _destConn = null;
+    currentState = ProxyState.disconnected;
+  }
+}
