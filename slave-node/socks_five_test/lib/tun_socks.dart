@@ -22,6 +22,8 @@ class TunSocks {
   ProxyState currentState = ProxyState.disconnected;
   int retryAttempts = 0;
 
+  List<int> accumulatedBuffer = [];
+
   final Function(String) logCallback;
   final Function(bool) connectionStatusCallback;
 
@@ -109,42 +111,40 @@ class TunSocks {
             return;
         }
 
+        accumulatedBuffer.addAll(data);
+
         // Parse master-slave protocol
         // Frame Structure:
         // Session ID (4 bytes)
         // Payload Length (4 bytes)
         // Payload Data
-        int offset = 0;
-        while (offset < data.length) {
-            // Parse the session ID and payload length
-            if (data.length - offset < 8) {
-            // Not enough data for header
-            break;
-            }
+        while (accumulatedBuffer.length >= 8) {
+            // Check if we have at least the header size (8 bytes)
+            // Header: 4 bytes for session ID + 4 bytes for payload length
 
-            int sessionId = _bytesToInt(data.sublist(offset, offset + 4));
-            int payloadLength = _bytesToInt(data.sublist(offset + 4, offset + 8));
-            offset += 8;
+            int sessionId = _bytesToInt(accumulatedBuffer.sublist(0, 4));
+            int payloadLength = _bytesToInt(accumulatedBuffer.sublist(4, 8));
 
             // Check if the entire payload is available
-            if (data.length - offset < payloadLength) {
-                // Not enough data for payload
-                logCallback('sessionId ${sessionId} ERR PAYLOAD : ${payloadLength} bytes');
+            if (accumulatedBuffer.length < 8 + payloadLength) {
+                // Not enough data for the entire frame, wait for more data
                 break;
             }
 
-            // Extract payload
-            List<int> payload = data.sublist(offset, offset + payloadLength);
-            offset += payloadLength;
+            // Extract the payload
+            List<int> payload = accumulatedBuffer.sublist(8, 8 + payloadLength);
+
+            // Remove the processed frame from the buffer
+            accumulatedBuffer = accumulatedBuffer.sublist(8 + payloadLength);
 
             // Handle the payload for the session
             Socks5Session session;
             if (sessions.containsKey(sessionId)) {
-            session = sessions[sessionId]!;
+                session = sessions[sessionId]!;
             } else {
-            // Create a new session
-            session = Socks5Session(sessionId, _masterConn, _sendToMasterInProtocol);
-            sessions[sessionId] = session;
+                // Create a new session
+                session = Socks5Session(sessionId, _masterConn, _sendToMasterInProtocol);
+                sessions[sessionId] = session;
             }
 
             // Process the payload within the session
@@ -194,10 +194,14 @@ class TunSocks {
   }
 
   void _sendToMasterInProtocol(int sessionId, List<int> data) {
-    List<int> header = _intToBytes(sessionId) + _intToBytes(data.length);
-    List<int> packet = header + data;
+    if (_masterConn != null && _masterConn!.remoteAddress != null) {
+      List<int> header = _intToBytes(sessionId) + _intToBytes(data.length);
+      List<int> packet = header + data;
 
-    _masterConn?.add(packet);
+      _masterConn?.add(packet);
+    } else {
+      logCallback('Attempted to send to master, but connection is closed.');
+    }
   }
 
   void stopTunnel() {

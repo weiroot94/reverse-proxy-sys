@@ -95,10 +95,13 @@ class _MyHomePageState extends State<MyHomePage> {
                   borderRadius: BorderRadius.circular(10),
                 ),
                 child: SingleChildScrollView(
-                  child: Text(
-                    _logMessages,
-                    style: TextStyle(fontSize: 14),
-                    textAlign: TextAlign.center,
+                  child: Container(
+                    width: MediaQuery.of(context).size.width * 0.7,
+                    child: Text(
+                      _logMessages,
+                      style: TextStyle(fontSize: 14),
+                      textAlign: TextAlign.left,
+                    ),
                   ),
                 ),
               ),
