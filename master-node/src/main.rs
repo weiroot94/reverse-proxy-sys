@@ -3,11 +3,10 @@ mod socks;
 
 use std::collections::HashMap;
 use std::error::Error;
-use log::LevelFilter;
-use net2::TcpStreamExt;
+use log::{LevelFilter, trace, debug, info, warn, error};
 use simple_logger::SimpleLogger;
 use getopts::Options;
-use utils::MAGIC_FLAG;
+use net2::TcpStreamExt;
 use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, task, net::{TcpListener, TcpStream}};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -158,7 +157,7 @@ impl ProxyManager {
         if let Some(client) = clients.get(&session_id) {
             // Send the payload to the client's mpsc sender
             if let Err(e) = client.tx.send(payload).await {
-                log::error!("Failed to send data using client's mpsc channel tx {}: {}", session_id, e);
+                error!("Failed to send data using client's mpsc channel tx {}: {}", session_id, e);
             }
         }
     }
@@ -168,7 +167,7 @@ impl ProxyManager {
         if let Some(slave) = self.slaves.lock().await.get(slave_ip) {
             slave.add_client_session(session_id).await;
         } else {
-            log::warn!("Slave {} is not alive yet", slave_ip);
+            warn!("Slave {} is not alive yet", slave_ip);
         }
     }
 
@@ -177,7 +176,7 @@ impl ProxyManager {
         if let Some(slave) = self.slaves.lock().await.get(slave_ip) {
             slave.remove_client_session(session_id).await;
         } else {
-            log::warn!("No slave found for IP: {}", slave_ip);
+            warn!("No slave found for IP: {}", slave_ip);
         }
     }
 
@@ -187,15 +186,15 @@ impl ProxyManager {
             let mut slaves = self.slaves.lock().await;
 
             if slaves.remove(slave_ip).is_some() {
-                log::info!("Removed disconnected slave: {}", slave_ip);
+                debug!("Removed disconnected slave: {}", slave_ip);
             } else {
-                log::warn!("Attempted to remove non-existent slave: {}", slave_ip);
+                warn!("Attempted to remove non-existent slave: {}", slave_ip);
                 return;
             }
         }
 
         if self.slave_recovery_mode == 1 {
-            log::info!("Waiting for slave {} to recover", slave_ip);
+            info!("Waiting for slave {} to recover", slave_ip);
             // In this mode, we simply wait for the slave to reconnect
             // Recovery logic should be handled in the connection loop
         } else if self.slave_recovery_mode == 2 {
@@ -204,7 +203,7 @@ impl ProxyManager {
             // Remove all IPs that were mapped to the disconnected slave
             ip_to_slave_map.retain(|_, mapped_slave_ip| {
                 if mapped_slave_ip == slave_ip {
-                    log::info!("Removing IP mapped to disconnected slave: {}", slave_ip);
+                    debug!("Removing IP mapped to disconnected slave: {}", slave_ip);
                     false
                 } else {
                     true
@@ -212,7 +211,7 @@ impl ProxyManager {
             });
         }
 
-        log::info!("Slave {} disconnected", slave_ip);
+        info!("Slave {} disconnected", slave_ip);
     }
 }
 
@@ -307,7 +306,7 @@ async fn handle_slave_io(
                     if header_read && accumulated_buffer.len() >= expected_payload_len {
                         // Extract the payload and route to the correct client
                         let payload = accumulated_buffer.drain(0..expected_payload_len).collect::<Vec<u8>>();
-                        log::info!("Slave -> Client: sid {}, size: {} bytes", session_id.clone(), expected_payload_len);
+                        trace!("Slave -> Client: sid {}, size: {} bytes", session_id.clone(), expected_payload_len);
                         proxy_manager.route_to_client(session_id, payload).await;
 
                         header_read = false;
@@ -323,7 +322,7 @@ async fn handle_slave_io(
                 // Check if the session ID is associated with this slave
                 let session_ids = slave.cli_sids.lock().await;
                 if session_ids.contains(&client_session_id) {
-                    log::info!("Client -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
+                    trace!("Client -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
                     let frame = build_frame(client_session_id, &client_data);
 
                     // Write the frame to the slave stream
@@ -353,7 +352,7 @@ async fn handle_client_io(
         if let Some(client) = clients.get(&session_id) {
             client.clone() // Assuming Client is Clone
         } else {
-            log::warn!("Client not found for session ID {}", session_id);
+            warn!("Client not found for session ID {}", session_id);
             return Ok(()); // Exit if the client is not found
         }
     };
@@ -371,7 +370,7 @@ async fn handle_client_io(
             } => {
                 let len = client_read?;
                 if len > 0 {
-                    log::info!("Broadcasting: sid {}, size: {} bytes", session_id.clone(), len);
+                    debug!("Broadcasting: sid {}, size: {} bytes", session_id.clone(), len);
                     let _ = proxy_manager.broadcast_tx.send((session_id, client_buffer[..len].to_vec()));
                 } else {
                     break;  // Client connection closed
@@ -399,7 +398,7 @@ async fn handle_client_io(
     }
 
     // Close the client stream
-    log::info!("Closing client stream for session ID {}.", session_id);
+    debug!("Closing client stream for session ID {}.", session_id);
     drop(cli_stream);
 
     Ok(())
@@ -431,7 +430,7 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
             Err(e) => {
-                log::error!("Error accepting connection: {}", e);
+                error!("Error accepting connection: {}", e);
                 return Err(Box::new(e)); // Return the error instead of Ok
             }
             Ok(p) => p,
@@ -441,13 +440,13 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
         raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
         let mut slave_stream = TcpStream::from_std(raw_stream).unwrap();
 
-        log::info!("New Slave {}:{}", slave_addr.ip(), slave_addr.port());
+        info!("New Slave {}:{}", slave_addr.ip(), slave_addr.port());
 
 		// Send a speed test request to the slave and measure the internet speed
         let download_speed_mbps = match send_speed_test_command(&mut slave_stream).await {
             Ok(speed) => speed,
             Err(e) => {
-                log::error!("Failed to measure internet speed for slave {}: {}", slave_addr.ip(), e);
+                error!("Failed to measure internet speed for slave {}: {}", slave_addr.ip(), e);
                 1.0
             }
         };
@@ -455,7 +454,7 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
         // Assign weight based on measured download speed
         let weight = download_speed_mbps.round() as isize;
 
-        log::info!("Slave {} Weight: {}", slave_addr.ip(), weight);
+        info!("Slave {} Weight: {}", slave_addr.ip(), weight);
 
         // Create a new Slave object
         let new_slave = Slave::new(slave_addr.ip().to_string(), weight as f64, slave_stream);
@@ -470,7 +469,7 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
             // Call the slave IO handler for the new slave
             let result = handle_slave_io(new_slave_clone, proxy_manager_clone).await;
             if let Err(e) = result {
-                log::error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
+                error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
             }
         });
     }
@@ -478,15 +477,6 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
 
 #[tokio::main]
 async fn main() -> io::Result<()>  {
-    // Initialize logging system
-    SimpleLogger::new()
-        .with_utc_timestamps()
-        .with_colors(true)
-        .init()
-        .unwrap();
-    ::log::set_max_level(LevelFilter::Info);
-
-    // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let program = args[0].clone();
 
@@ -511,6 +501,10 @@ async fn main() -> io::Result<()>  {
                 "slave_recovery",
                 "Set the slave recovery mode: wait (1) or reconnect (2). Only available when proxy_mode=stick",
                 "MODE");
+    opts.optopt("v",
+                "verbosity",
+                "Set the verbosity level (trace, debug, info, warn, error)",
+                "LEVEL");
 
     let matches = opts.parse(&args[1..]).unwrap_or_else(|_| {
         usage(&program, &opts);
@@ -523,7 +517,7 @@ async fn main() -> io::Result<()>  {
         "stick" => 1,
         "nonstick" => 2,
         _ => {
-            log::error!("Invalid proxy mode. Using default (stick).");
+            error!("Invalid proxy mode. Using default (stick).");
             1
         }
     };
@@ -537,16 +531,41 @@ async fn main() -> io::Result<()>  {
                 "wait" => 1,
                 "reconnect" => 2,
                 _ => {
-                    log::error!("Invalid slave recovery mode. Using default (reconnect).");
+                    error!("Invalid slave recovery mode. Using default (reconnect).");
                     1
                 }
             })
             .unwrap_or(1)
     } else {
         // For nonstick mode, we don't handle slave_recovery
-        log::info!("Slave recovery is ignored in nonstick mode.");
+        info!("Slave recovery is ignored in nonstick mode.");
         0 // Use 0 to signify that slave recovery isn't relevant in nonstick mode
     };
+
+    // Determine the verbosity level
+    let verbosity = matches.opt_str("v").unwrap_or_else(|| "info".to_string());
+
+    let level_filter = match verbosity.as_str() {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "info" => LevelFilter::Info,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _ => {
+            eprintln!("Invalid verbosity level specified. Defaulting to 'info'.");
+            LevelFilter::Info
+        }
+    };
+
+    // Initialize logging system with the specified verbosity level
+    SimpleLogger::new()
+        .with_utc_timestamps()
+        .with_colors(true)
+        .with_level(level_filter) // Set the verbosity level
+        .init()
+        .unwrap();
+    
+    ::log::set_max_level(level_filter);
 
     // Global store of proxy system
     let (broadcast_tx, broadcast_rx) = broadcast::channel(100);
@@ -562,7 +581,7 @@ async fn main() -> io::Result<()>  {
 
     if matches.opt_count("t") > 0 {
         let master_addr: String = matches.opt_str("t").unwrap_or_else(|| {
-            log::error!("Not found listen port. eg: net-relay -t 0.0.0.0:8000 -s 0.0.0.0:1080");
+            error!("Not found listen port. eg: net-relay -t 0.0.0.0:8000 -s 0.0.0.0:1080");
             std::process::exit(1);
         });
 
@@ -571,11 +590,11 @@ async fn main() -> io::Result<()>  {
             std::process::exit(1);
         });
 
-        log::info!("Waiting for Slave nodes on {}", master_addr);
+        info!("Waiting for Slave nodes on {}", master_addr);
 
         let slave_listener = match TcpListener::bind(&master_addr).await {
             Err(e) => {
-                log::error!("Failed to bind slave listener: {}", e);
+                error!("Failed to bind slave listener: {}", e);
                 return Ok(());
             }
             Ok(p) => p,
@@ -585,7 +604,7 @@ async fn main() -> io::Result<()>  {
             let proxy_manager = Arc::clone(&proxy_manager);
             async move {
                 if let Err(e) = handle_slave_connections(slave_listener, proxy_manager).await {
-                    log::error!("Connection handler error: {}", e);
+                    error!("Connection handler error: {}", e);
                 }
             }
         });
@@ -594,7 +613,7 @@ async fn main() -> io::Result<()>  {
 
         let client_listener = match TcpListener::bind(&socks_addr).await {
             Err(e) => {
-                log::error!("Failed to bind SOCKS5 listener: {}", e);
+                error!("Failed to bind SOCKS5 listener: {}", e);
                 return Ok(());
             }
             Ok(p) => p,
@@ -604,12 +623,12 @@ async fn main() -> io::Result<()>  {
             let (client_stream, client_addr) = match client_listener.accept().await {
                 Ok(stream) => stream,
                 Err(e) => {
-                    log::error!("Error accepting client connection: {}", e);
+                    error!("Error accepting client connection: {}", e);
                     continue; // Continue the loop on error
                 }
             };
 
-            log::info!("New Client: {}", client_addr.ip());
+            debug!("New Client: {}", client_addr.ip());
 
 			// Generate a new session ID for this client
 			let session_id = rand::random::<u32>();
@@ -635,7 +654,7 @@ async fn main() -> io::Result<()>  {
                 let proxy_manager_clone = Arc::clone(&proxy_manager);
                 tokio::spawn(handle_client_io(session_id, proxy_manager_clone));
             } else {
-                log::warn!("No available slave for client with session ID {}", session_id);
+                warn!("No available slave for client with session ID {}", session_id);
             }
         }
     } else {
