@@ -17,12 +17,13 @@ class TunSocks {
   final String host;
   final int port;
   late Socket? _masterConn;
-  late Socket? _destConn;
 
   ProxyState currentState = ProxyState.disconnected;
   int retryAttempts = 0;
 
   List<int> accumulatedBuffer = [];
+
+  bool speedTestDone = false;
 
   final Function(String) logCallback;
   final Function(bool) connectionStatusCallback;
@@ -56,59 +57,59 @@ class TunSocks {
         },
         onDone: () {
           logCallback('Master connection closed');
-          currentState = ProxyState.disconnected;
-          connectionStatusCallback(false);
-
-          if (currentState != ProxyState.manuallyStopped) {
-            _retryConnection();
-          }
+          _handleDisconnection();
         },
         onError: (error) {
           logCallback('Master connection error: $error');
-          _cleanupConnections();
-          connectionStatusCallback(false);
-          _retryConnection();
+          _handleDisconnection();
         },
       );
     } catch (e) {
       logCallback('Failed to connect to master: $e');
-      currentState = ProxyState.disconnected;
-      connectionStatusCallback(false);
+      _handleDisconnection();
+    }
+  }
+
+  void _handleDisconnection() {
+    currentState = ProxyState.disconnected;
+    connectionStatusCallback(false);
+    _cleanupConnections();
+
+    if (currentState != ProxyState.manuallyStopped) {
       _retryConnection();
     }
   }
 
   Future<void> _retryConnection() async {
-    if (retryAttempts % 5 != 0 || retryAttempts == 0) {
-      Future.delayed(Duration(seconds: 5), () {
-        retryAttempts++;
-        logCallback('Retrying connection... Attempt $retryAttempts');
-        startTunnel();
-      });
-    } else {
-      Future.delayed(Duration(minutes: 1), () {
-        retryAttempts++;
-        logCallback('Resuming retries after 1 minute. Attempt $retryAttempts');
-        startTunnel();
-      });
-    }
+    final retryDelay = (retryAttempts % 5 == 0 && retryAttempts != 0)
+        ? Duration(minutes: 1)
+        : Duration(seconds: 5);
+    retryAttempts++;
+    await Future.delayed(retryDelay);
+    logCallback('Retrying connection... Attempt $retryAttempts');
+    startTunnel();
   }
 
   void _processData(List<int> data) async {
     try {
         // Process data based on received commands
-        String command = String.fromCharCodes(data).trim();
-        if (command.startsWith('SPEED_TEST')) {
-            String url = command.split(' ')[1];
-            double speedMbps = await _performSpeedTest(url);
+        if (!speedTestDone) {
+            String command = String.fromCharCodes(data).trim();
+            if (command.startsWith('SPEED_TEST')) {
+                String url = command.split(' ')[1];
+                double speedMbps = await _performSpeedTest(url);
 
-            logCallback('Speed test result: $speedMbps Mbps');
+                logCallback('Speed test result: $speedMbps Mbps');
 
-            // Send result back to the master
-            Uint8List result = Uint8List.fromList('SPEED $speedMbps\n'.codeUnits);
-            _masterConn?.add(result);
-            await _masterConn?.flush();
-            return;
+                // Send result back to the master
+                Uint8List result = Uint8List.fromList('SPEED $speedMbps\n'.codeUnits);
+                _masterConn?.add(result);
+                await _masterConn?.flush();
+
+                speedTestDone = true;
+
+                return;
+            }
         }
 
         accumulatedBuffer.addAll(data);
@@ -121,7 +122,6 @@ class TunSocks {
         while (accumulatedBuffer.length >= 8) {
             // Check if we have at least the header size (8 bytes)
             // Header: 4 bytes for session ID + 4 bytes for payload length
-
             int sessionId = _bytesToInt(accumulatedBuffer.sublist(0, 4));
             int payloadLength = _bytesToInt(accumulatedBuffer.sublist(4, 8));
 
@@ -131,24 +131,17 @@ class TunSocks {
                 break;
             }
 
-            // Extract the payload
+            // Extract the payload and remove it from the buffer
             List<int> payload = accumulatedBuffer.sublist(8, 8 + payloadLength);
-
-            // Remove the processed frame from the buffer
-            accumulatedBuffer = accumulatedBuffer.sublist(8 + payloadLength);
+            accumulatedBuffer.removeRange(0, 8 + payloadLength);
 
             // Handle the payload for the session
-            Socks5Session session;
-            if (sessions.containsKey(sessionId)) {
-                session = sessions[sessionId]!;
-            } else {
-                // Create a new session
-                session = Socks5Session(sessionId, _masterConn, _sendToMasterInProtocol);
-                sessions[sessionId] = session;
-            }
+            Socks5Session session = sessions.putIfAbsent(sessionId, () {
+                return Socks5Session(sessionId, _masterConn, _sendToMasterInProtocol);
+            });
 
             // Process the payload within the session
-            await session.processSocks5Data(payload);
+            session.processSocks5Data(payload);
         }
     } catch (e) {
       logCallback('Error processing data: $e');
@@ -213,9 +206,7 @@ class TunSocks {
 
   void _cleanupConnections() {
     _masterConn?.close();
-    _destConn?.destroy();
     _masterConn = null;
-    _destConn = null;
     currentState = ProxyState.disconnected;
   }
 }
