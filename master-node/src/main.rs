@@ -1,20 +1,17 @@
-mod utils;
-mod socks;
-
 use std::collections::HashMap;
 use std::error::Error;
 use log::{LevelFilter, trace, debug, info, warn, error};
 use simple_logger::SimpleLogger;
 use getopts::Options;
 use net2::TcpStreamExt;
-use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, task, net::{TcpListener, TcpStream}};
+use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, net::{TcpListener, TcpStream}};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
 
 const KEEP_ALIVE_DURATION: u64 = 10;
-const MAX_BUF_SIZE: usize = 4096;
+const MAX_BUF_SIZE: usize = 8192;
 
 #[derive(Clone)]
 struct Slave {
@@ -39,23 +36,16 @@ impl Slave {
         cli_sids.push(session_id);
     }
 
-    // Method to remove a session ID
     async fn remove_client_session(&self, session_id: u32) {
         let mut cli_sids = self.cli_sids.lock().await;
-        cli_sids.retain(|&id| id != session_id); // Retain only those IDs that do not match
-    }
-
-    // Method to get the current number of connected sessions
-    async fn num_connected_clients(&self) -> usize {
-        let cli_sids = self.cli_sids.lock().await;
-        cli_sids.len()
+        if let Some(pos) = cli_sids.iter().position(|&x| x == session_id) {
+            cli_sids.remove(pos);
+        }
     }
 }
 
 #[derive(Clone)]
 struct Client {
-    ip_addr: String,
-    sid: u32,
     stream: Arc<AsyncMutex<TcpStream>>,
     tx: mpsc::Sender<Vec<u8>>,
     rx: Arc<AsyncMutex<mpsc::Receiver<Vec<u8>>>>,
@@ -63,9 +53,9 @@ struct Client {
 }
 
 impl Client {
-    fn new(ip_addr: String, sid: u32, stream: Arc<AsyncMutex<TcpStream>>) -> Self {
+    fn new(stream: Arc<AsyncMutex<TcpStream>>) -> Self {
         let (tx, rx) = mpsc::channel(100);
-        let client = Self { ip_addr, sid, stream: stream.clone(), tx: tx.clone(), rx: Arc::new(AsyncMutex::new(rx)), selected_slave_ip: None };
+        let client = Self { stream: stream.clone(), tx: tx.clone(), rx: Arc::new(AsyncMutex::new(rx)), selected_slave_ip: None };
         client
     }
 }
@@ -88,19 +78,6 @@ struct ProxyManager {
 }
 
 impl ProxyManager {
-    fn new() -> Self {
-        let (broadcast_tx, broadcast_rx) = broadcast::channel(100);
-        Self {
-            client_assign_mode: 1,
-            slave_recovery_mode: 2,
-            slaves: Arc::new(AsyncMutex::new(HashMap::new())),
-            clients: Arc::new(AsyncMutex::new(HashMap::new())),
-            broadcast_tx,
-            broadcast_rx,
-            cli_ip_to_slave: Arc::new(AsyncMutex::new(HashMap::new())),
-        }
-    }
-
     // Get an available slave stream using weighted round-robin
     async fn get_available_slave_ip(&self, client_ip: &String) -> Option<String> {
         let mut cli_ip_to_slave = self.cli_ip_to_slave.lock().await;
@@ -228,11 +205,6 @@ fn bytes_to_u32(bytes: &[u8]) -> u32 {
     let mut array = [0u8; 4];
     array.copy_from_slice(bytes);
     u32::from_be_bytes(array)
-}
-
-// Utility function to convert an integer to bytes
-fn u32_to_bytes(value: u32) -> [u8; 4] {
-    value.to_be_bytes()
 }
 
 // Prepend the session ID and the payload length
@@ -641,10 +613,8 @@ async fn main() -> io::Result<()>  {
                 raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
                 let client_stream = Arc::new(AsyncMutex::new(TcpStream::from_std(raw_stream).unwrap()));
 
-                // Create a new Client object
-                let client = Client::new(client_ip, session_id, client_stream.clone());
-
-                // Register the client in the ProxyManager
+                // Create and register a new Client object
+                let client = Client::new(client_stream.clone());
                 proxy_manager.clients.lock().await.insert(session_id, client);
 
                 // Add the session ID to the selected slave
