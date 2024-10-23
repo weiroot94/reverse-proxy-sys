@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'tun_socks.dart';
-import 'socks5_session.dart';
 
 void main() {
   runApp(MyApp());

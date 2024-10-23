@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:logging/logging.dart';
 import 'package:http/http.dart' as http;
+import 'package:synchronized/synchronized.dart';
 import 'dart:async';
 import 'dart:typed_data';
 
@@ -10,19 +11,21 @@ enum ProxyState {
   disconnected,
   connecting,
   connected,
-  manuallyStopped,
 }
 
 class TunSocks {
   final String host;
   final int port;
+
   late Socket? _masterConn;
+  final _masterConnLock = Lock();
 
   ProxyState currentState = ProxyState.disconnected;
   int retryAttempts = 0;
 
   List<int> accumulatedBuffer = [];
 
+  bool isManuallyStopped = false;
   bool speedTestDone = false;
 
   final Function(String) logCallback;
@@ -41,6 +44,8 @@ class TunSocks {
     }
 
     currentState = ProxyState.connecting;
+    isManuallyStopped = false;
+  
     logCallback('Connecting to master node...');
     connectionStatusCallback(false);
 
@@ -75,7 +80,7 @@ class TunSocks {
     connectionStatusCallback(false);
     _cleanupConnections();
 
-    if (currentState != ProxyState.manuallyStopped) {
+    if (!isManuallyStopped) {
       _retryConnection();
     }
   }
@@ -186,19 +191,24 @@ class TunSocks {
     ];
   }
 
-  void _sendToMasterInProtocol(int sessionId, List<int> data) {
-    if (_masterConn != null && _masterConn!.remoteAddress != null) {
-      List<int> header = _intToBytes(sessionId) + _intToBytes(data.length);
-      List<int> packet = header + data;
-
-      _masterConn?.add(packet);
-    } else {
-      logCallback('Attempted to send to master, but connection is closed.');
-    }
+  void _sendToMasterInProtocol(int sessionId, List<int> data) async {
+    await _masterConnLock.synchronized(() async {
+      if (_masterConn != null) {
+        List<int> header = _intToBytes(sessionId) + _intToBytes(data.length);
+        List<int> packet = header + data;
+        
+        try {
+          _masterConn?.add(packet);
+          await _masterConn?.flush();
+        } catch (e) {
+          print('Failed to send to master in protocol: $e');
+        }
+      }
+    });
   }
 
   void stopTunnel() {
-    currentState = ProxyState.manuallyStopped;
+    isManuallyStopped = true;
     _cleanupConnections();
     connectionStatusCallback(false);
     logCallback('Proxy server stopped.');
@@ -207,6 +217,7 @@ class TunSocks {
   void _cleanupConnections() {
     _masterConn?.close();
     _masterConn = null;
+    speedTestDone = false;
     currentState = ProxyState.disconnected;
   }
 }

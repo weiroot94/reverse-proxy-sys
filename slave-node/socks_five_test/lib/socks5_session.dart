@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:synchronized/synchronized.dart';
 import 'package:logging/logging.dart';
 import 'dart:typed_data';
 import 'dart:convert';
@@ -18,6 +19,7 @@ class Socks5Session {
   final int sessionId;
   final Socket? _master_conn;
   Socket? _dest_conn;
+  final _destConnLock = Lock();
 
   States currentState = States.handshake;
 
@@ -36,7 +38,7 @@ class Socks5Session {
 
             // Respond with method selection
             Uint8List handshakeRes = Uint8List.fromList([5, 0]);
-            _sendData(handshakeRes);
+            await _sendToClient(handshakeRes);
 
             currentState = States.handling;
             break;
@@ -82,7 +84,6 @@ class Socks5Session {
 
               default:
                 print('Unknown address type: $addrType');
-                _master_conn?.close();
                 return;
             }
 
@@ -90,24 +91,25 @@ class Socks5Session {
               _dest_conn = await Socket.connect(address, port, timeout: Duration(seconds: 5));
 
               // Reply: succeeded
-              _sendData(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
-              await _master_conn?.flush();
+              if (_dest_conn != null) {
+                await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+
+                currentState = States.proxying;
+
+                _dest_conn?.listen((data) {
+                  _sendToClient(data);
+                }, onDone: () {
+                  _closeSession();
+                });
+              }
             } catch (e) {
               print('Connection to $address:$port failed to resolve: $e');
-              _master_conn?.close();
-            }
-            currentState = States.proxying;
-
-            _dest_conn?.listen((data) {
-              _sendData(data);
-            }, onDone: () {
               _closeSession();
-            });
-
+            }
             break;
 
           case States.proxying:
-            _dest_conn?.add(data);
+            _sendToDest(data);
             break;
       }
     } catch (e) {
@@ -116,13 +118,34 @@ class Socks5Session {
     }
   }
 
-  void _sendData(List<int> data) {
-    _sendDataToMaster(sessionId, data);
+  Future<void> _sendToClient(List<int> data) async {
+    await _sendDataToMaster(sessionId, data);
   }
 
-  void _closeSession() {
-    print('sessionId ${sessionId} EXIT');
-    _dest_conn?.close();
+  void _sendToDest(List<int> data) async {
+    await _destConnLock.synchronized(() async {
+      if (_dest_conn != null) {
+        try {
+          _dest_conn?.add(data);
+          await _dest_conn?.flush();
+        } catch (e) {
+          print('Failed to send data to destination: $e');
+        }
+      }
+    });
+  }
+
+  void _closeSession() async {
+    await _destConnLock.synchronized(() async {
+      if (_dest_conn != null) {
+        try {
+          _dest_conn?.close();
+        } catch (e) {
+          print('Failed to close destination connection: $e');
+        }
+      }
+    });
+
     // Remove session from sessions map
     sessions.remove(sessionId);
   }
