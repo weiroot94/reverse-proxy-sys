@@ -278,7 +278,7 @@ async fn handle_slave_io(
                     if header_read && accumulated_buffer.len() >= expected_payload_len {
                         // Extract the payload and route to the correct client
                         let payload = accumulated_buffer.drain(0..expected_payload_len).collect::<Vec<u8>>();
-                        trace!("Slave -> Client: sid {}, size: {} bytes", session_id.clone(), expected_payload_len);
+                        trace!("Slave -> Master: sid {}, size: {} bytes", session_id.clone(), expected_payload_len);
                         proxy_manager.route_to_client(session_id, payload).await;
 
                         header_read = false;
@@ -294,7 +294,7 @@ async fn handle_slave_io(
                 // Check if the session ID is associated with this slave
                 let session_ids = slave.cli_sids.lock().await;
                 if session_ids.contains(&client_session_id) {
-                    trace!("Client -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
+                    trace!("Master -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
                     let frame = build_frame(client_session_id, &client_data);
 
                     // Write the frame to the slave stream
@@ -342,7 +342,7 @@ async fn handle_client_io(
             } => {
                 let len = client_read?;
                 if len > 0 {
-                    debug!("Broadcasting: sid {}, size: {} bytes", session_id.clone(), len);
+                    trace!("Client -> Master: sid {}, size: {} bytes", session_id.clone(), len);
                     let _ = proxy_manager.broadcast_tx.send((session_id, client_buffer[..len].to_vec()));
                 } else {
                     break;  // Client connection closed
@@ -352,6 +352,7 @@ async fn handle_client_io(
             // Read from the slave and send to client
             Some(response) = rx.recv() => {
                 // Send the response back to the client
+                trace!("Master -> Client: size: {} bytes", response.len());
                 cli_stream.write_all(&response[..]).await?;
                 cli_stream.flush().await?;
             },
@@ -558,7 +559,7 @@ async fn main() -> io::Result<()>  {
         });
 
         let socks_addr: String = matches.opt_str("s").unwrap_or_else(|| {
-            log::error!("Not found listen port. eg: net-relay -t 0.0.0.0:8000 -s 0.0.0.0:1080");
+            error!("Not found listen port. eg: net-relay -t 0.0.0.0:8000 -s 0.0.0.0:1080");
             std::process::exit(1);
         });
 
