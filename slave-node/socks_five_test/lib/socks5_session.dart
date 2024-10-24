@@ -1,11 +1,8 @@
 import 'dart:io';
 import 'package:synchronized/synchronized.dart';
-import 'package:logging/logging.dart';
 import 'dart:typed_data';
 import 'dart:convert';
 import 'dart:async';
-
-final Logger log = Logger('Socks5Session');
 
 // Enum for address types
 enum Addr { v4, v6, domain }
@@ -88,19 +85,22 @@ class Socks5Session {
             }
 
             try {
-              _dest_conn = await Socket.connect(address, port, timeout: Duration(seconds: 5));
+              _dest_conn = await Socket.connect(address, port, timeout: Duration(seconds: 10));
 
-              // Reply: succeeded
               if (_dest_conn != null) {
-                await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
-
                 currentState = States.proxying;
 
-                _dest_conn?.listen((data) {
-                  _sendToClient(data);
+                _dest_conn?.listen((data) async {
+                  await _sendToClient(data);
                 }, onDone: () {
                   _closeSession();
+                }, onError: (error) {
+                  print('Error on destination connection: $error');
+                  _closeSession();
                 });
+
+                // Respond to client
+                await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
               }
             } catch (e) {
               print('Connection to $address:$port failed to resolve: $e');
@@ -109,20 +109,24 @@ class Socks5Session {
             break;
 
           case States.proxying:
-            _sendToDest(data);
+            await _sendToDest(data);
             break;
       }
     } catch (e) {
       print('Error in session $sessionId: $e');
-      _closeSession();
+      //_closeSession();
     }
   }
 
   Future<void> _sendToClient(List<int> data) async {
-    await _sendDataToMaster(sessionId, data);
+    try {
+      await _sendDataToMaster(sessionId, data);
+    } catch (e) {
+      print('Failed to send data to master: $e');
+    }
   }
 
-  void _sendToDest(List<int> data) async {
+  Future<void> _sendToDest(List<int> data) async {
     await _destConnLock.synchronized(() async {
       if (_dest_conn != null) {
         try {
