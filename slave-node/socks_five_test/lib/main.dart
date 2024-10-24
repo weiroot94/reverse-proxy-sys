@@ -22,7 +22,7 @@ class MyHomePage extends StatefulWidget {
   _MyHomePageState createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
+class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   late TunSocks _tunSocks;
   String _connectionStatus = "Disconnected";
   String _logMessages = "";
@@ -30,6 +30,7 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _tunSocks = TunSocks(
       host: '188.245.104.81',
       port: 8000,
@@ -48,8 +49,16 @@ class _MyHomePageState extends State<MyHomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _tunSocks.stopTunnel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.detached) {
+      _tunSocks.stopTunnel();
+    }
   }
 
   @override
