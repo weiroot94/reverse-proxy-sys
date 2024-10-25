@@ -9,16 +9,20 @@ use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
+use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration};
+use std::collections::HashSet;
 
 const KEEP_ALIVE_DURATION: u64 = 10;
 const MAX_BUF_SIZE: usize = 8192;
+const CONNECTION_TIMEOUT: u64 = 10;
 
 #[derive(Clone)]
 struct Slave {
     ip_addr: String,
     net_speed: f64, // Weight for round robin
     stream: Arc<AsyncMutex<TcpStream>>,
-    cli_sids: Arc<AsyncMutex<Vec<u32>>>,
+    cli_sids: Arc<RwLock<HashSet<u32>>>,
 }
 
 impl Slave {
@@ -27,20 +31,18 @@ impl Slave {
             ip_addr,
             net_speed,
             stream: Arc::new(AsyncMutex::new(stream)),
-            cli_sids: Arc::new(AsyncMutex::new(Vec::new())),
+            cli_sids: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
     async fn add_client_session(&self, session_id: u32) {
-        let mut cli_sids = self.cli_sids.lock().await;
-        cli_sids.push(session_id);
+        let mut cli_sids = self.cli_sids.write().await;
+        cli_sids.insert(session_id);
     }
 
     async fn remove_client_session(&self, session_id: u32) {
-        let mut cli_sids = self.cli_sids.lock().await;
-        if let Some(pos) = cli_sids.iter().position(|&x| x == session_id) {
-            cli_sids.remove(pos);
-        }
+        let mut cli_sids = self.cli_sids.write().await;
+        cli_sids.remove(&session_id);
     }
 }
 
@@ -178,14 +180,7 @@ impl ProxyManager {
             let mut ip_to_slave_map = self.cli_ip_to_slave.lock().await;
 
             // Remove all IPs that were mapped to the disconnected slave
-            ip_to_slave_map.retain(|_, mapped_slave_ip| {
-                if mapped_slave_ip == slave_ip {
-                    debug!("Removing IP mapped to disconnected slave: {}", slave_ip);
-                    false
-                } else {
-                    true
-                }
-            });
+            ip_to_slave_map.retain(|_, mapped_slave_ip| mapped_slave_ip != slave_ip);
         }
 
         info!("Slave {} disconnected", slave_ip);
@@ -222,7 +217,7 @@ async fn read_from_slave(
     buffer: &mut [u8]
 ) -> Result<usize, std::io::Error> {
     let mut slave_stream = slave.stream.lock().await;
-    slave_stream.read(buffer).await
+    timeout(Duration::from_secs(CONNECTION_TIMEOUT), slave_stream.read(buffer)).await?
 }
 
 // Helper function to write to the slave stream
@@ -232,7 +227,8 @@ async fn write_to_slave(
 ) -> Result<(), std::io::Error> {
     let mut slave_stream = slave.stream.lock().await;
     slave_stream.write_all(frame).await?;
-    slave_stream.flush().await
+    slave_stream.flush().await?;
+    Ok(())
 }
 
 
@@ -292,7 +288,7 @@ async fn handle_slave_io(
             // Handle traffic from clients (broadcast receiver)
             Ok((client_session_id, client_data)) = cli_broadcast_rx.recv() => {
                 // Check if the session ID is associated with this slave
-                let session_ids = slave.cli_sids.lock().await;
+                let session_ids = slave.cli_sids.read().await;
                 if session_ids.contains(&client_session_id) {
                     trace!("Master -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
                     let frame = build_frame(client_session_id, &client_data);
