@@ -17,9 +17,7 @@ class Socks5Session {
   final Socket? _master_conn;
   Socket? _dest_conn;
   final _destConnLock = Lock();
-
   States currentState = States.handshake;
-
   final Function(int, List<int>) _sendDataToMaster;
 
   Socks5Session(this.sessionId, this._master_conn, this._sendDataToMaster);
@@ -30,33 +28,26 @@ class Socks5Session {
           case States.handshake:
             if (data.length < 2) return;
 
-            final version = data[0];
-            if (version != 5) return;
+            // Check version
+            if (data[0] != 5) return;
 
             // Respond with method selection
-            Uint8List handshakeRes = Uint8List.fromList([5, 0]);
-            await _sendToClient(handshakeRes);
-
+            await _sendToClient(Uint8List.fromList([5, 0]));
             currentState = States.handling;
             break;
 
           case States.handling:
             if (data.length < 4) return;
 
-            final version = data[0];
-            if (version != 5) {
+            if (data[0] != 5) return _master_conn?.close();
+
+            // Check command
+            if (data[1] != 1) {
               _master_conn?.close();
               return;
             }
 
-            final cmd = data[1];
-            if (cmd != 1) {
-              print('Unsupported command: $cmd');
-              _master_conn?.close();
-              return;
-            }
-
-            final reserved = data[2]; // Reserved byte
+            // Secondary byte is reserved one
             final addrType = data[3];
 
             String address;
@@ -86,22 +77,19 @@ class Socks5Session {
 
             try {
               _dest_conn = await Socket.connect(address, port, timeout: Duration(seconds: 10));
+              currentState = States.proxying;
 
-              if (_dest_conn != null) {
-                currentState = States.proxying;
+              _dest_conn?.listen((data) async {
+                await _sendToClient(data);
+              }, onDone: () {
+                _closeSession();
+              }, onError: (error) {
+                print('Error on destination connection: $error');
+                _closeSession();
+              });
 
-                _dest_conn?.listen((data) async {
-                  await _sendToClient(data);
-                }, onDone: () {
-                  _closeSession();
-                }, onError: (error) {
-                  print('Error on destination connection: $error');
-                  _closeSession();
-                });
-
-                // Respond to client
-                await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
-              }
+              // Respond to client
+              await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
             } catch (e) {
               print('Connection to $address:$port failed to resolve: $e');
               _closeSession();
@@ -114,7 +102,7 @@ class Socks5Session {
       }
     } catch (e) {
       print('Error in session $sessionId: $e');
-      //_closeSession();
+      _closeSession();
     }
   }
 
@@ -141,13 +129,8 @@ class Socks5Session {
 
   void _closeSession() async {
     await _destConnLock.synchronized(() async {
-      if (_dest_conn != null) {
-        try {
-          _dest_conn?.close();
-        } catch (e) {
-          print('Failed to close destination connection: $e');
-        }
-      }
+      await _dest_conn?.close();
+      _dest_conn = null;
     });
 
     // Remove session from sessions map

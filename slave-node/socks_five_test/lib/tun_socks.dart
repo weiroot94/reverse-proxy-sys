@@ -4,29 +4,66 @@ import 'package:http/http.dart' as http;
 import 'package:synchronized/synchronized.dart';
 import 'dart:async';
 import 'dart:typed_data';
-
+import 'dart:convert';
 import 'socks5_session.dart';
 
-enum ProxyState {
-  disconnected,
-  connecting,
-  connected,
+enum ProxyState { disconnected, connecting, connected, }
+
+// Command Type constants
+const int dataPacket = 0x00;
+const int commandPacket = 0x01;
+// Command ID constants
+const int speedCheck = 0x01;
+const int versionCheck = 0x02;
+
+class ProtocolPacket {
+  final int sessionId;
+  final int packetType;
+  final int commandId;
+  final List<int> payload;
+
+  ProtocolPacket(this.sessionId, this.packetType, this.commandId, this.payload);
+}
+
+class MasterTrafficParser extends StreamTransformerBase<List<int>, ProtocolPacket> {
+  final List<int> _buffer = [];
+
+  @override
+  Stream<ProtocolPacket> bind(Stream<List<int>> stream) async* {
+    await for (var dataChunk in stream) {
+      _buffer.addAll(dataChunk);
+
+      while (_buffer.length >= 10) {
+        final packetType = _buffer[0];
+        final sessionId = _bytesToInt(_buffer.sublist(1, 5));
+        final commandId = _buffer[5];
+        final payloadLength = _bytesToInt(_buffer.sublist(6, 10));
+
+        if (_buffer.length < 10 + payloadLength) break;
+
+        final payload = _buffer.sublist(10, 10 + payloadLength);
+        _buffer.removeRange(0, 10 + payloadLength);
+
+        yield ProtocolPacket(sessionId, packetType, commandId, payload);
+      }
+    }
+  }
+
+  int _bytesToInt(List<int> bytes) {
+    return bytes.fold(0, (acc, byte) => (acc << 8) + byte);
+  }
 }
 
 class TunSocks {
   final String host;
   final int port;
-
   late Socket? _masterConn;
   final _masterConnLock = Lock();
-
   ProxyState currentState = ProxyState.disconnected;
   int retryAttempts = 0;
-
   List<int> accumulatedBuffer = [];
-
   bool isManuallyStopped = false;
-  bool speedTestDone = false;
+  final String slaveVersion = "1.0.0";
 
   final Function(String) logCallback;
   final Function(bool) connectionStatusCallback;
@@ -39,39 +76,53 @@ class TunSocks {
   });
 
   Future<void> startTunnel() async {
-    if (currentState == ProxyState.connecting || currentState == ProxyState.connected) {
-      return;
-    }
+    if (currentState != ProxyState.disconnected) return;
 
     currentState = ProxyState.connecting;
     isManuallyStopped = false;
-  
     logCallback('Connecting to master node...');
     connectionStatusCallback(false);
 
     try {
       _masterConn = await Socket.connect(host, port);
       logCallback('Connected to master node: $host:$port');
-
       currentState = ProxyState.connected;
       connectionStatusCallback(true);
 
-      _masterConn!.listen(
-        (data) {
-          _processData(data);
-        },
-        onDone: () {
-          logCallback('Master connection closed');
-          _handleDisconnection();
-        },
-        onError: (error) {
-          logCallback('Master connection error: $error');
-          _handleDisconnection();
-        },
-      );
+      _masterConn!
+          .transform(StreamTransformer.fromBind((stream) => MasterTrafficParser().bind(stream)))
+          .listen((packet) async {
+            if (packet.packetType == dataPacket) {
+              // Handle data packets through SOCKS5 sessions
+              final session = sessions.putIfAbsent(
+                  packet.sessionId,
+                  () => Socks5Session(packet.sessionId, _masterConn, _sendDataPacket));
+              session.processSocks5Data(packet.payload);
+
+            } else if (packet.packetType == commandPacket) {
+              await _handleCommand(packet.commandId, packet.payload);
+            }
+          },
+          onDone: _handleDisconnection,
+          onError: (error) {
+            logCallback('Master connection error: $error');
+            _handleDisconnection();
+          });
     } catch (e) {
       logCallback('Failed to connect to master: $e');
       _handleDisconnection();
+    }
+  }
+
+  Future<void> _handleCommand(int? commandId, List<int> payload) async {
+    if (commandId == speedCheck) {
+      logCallback('Received command: SPEED_TEST');
+      await _performSpeedTest(payload);
+    } else if (commandId == versionCheck) {
+      logCallback('Received command: VERSION_INFO');
+      _sendVersionInfo();
+    } else {
+      logCallback('Unknown command received');
     }
   }
 
@@ -95,66 +146,8 @@ class TunSocks {
     startTunnel();
   }
 
-  void _processData(List<int> data) async {
-    try {
-        // Process data based on received commands
-        if (!speedTestDone) {
-            String command = String.fromCharCodes(data).trim();
-            if (command.startsWith('SPEED_TEST')) {
-                String url = command.split(' ')[1];
-                double speedMbps = await _performSpeedTest(url);
-
-                logCallback('Speed test result: $speedMbps Mbps');
-
-                // Send result back to the master
-                Uint8List result = Uint8List.fromList('SPEED $speedMbps\n'.codeUnits);
-                _masterConn?.add(result);
-                await _masterConn?.flush();
-
-                speedTestDone = true;
-
-                return;
-            }
-        }
-
-        accumulatedBuffer.addAll(data);
-
-        // Parse master-slave protocol
-        // Frame Structure:
-        // Session ID (4 bytes)
-        // Payload Length (4 bytes)
-        // Payload Data
-        while (accumulatedBuffer.length >= 8) {
-            // Check if we have at least the header size (8 bytes)
-            // Header: 4 bytes for session ID + 4 bytes for payload length
-            int sessionId = _bytesToInt(accumulatedBuffer.sublist(0, 4));
-            int payloadLength = _bytesToInt(accumulatedBuffer.sublist(4, 8));
-
-            // Check if the entire payload is available
-            if (accumulatedBuffer.length < 8 + payloadLength) {
-                // Not enough data for the entire frame, wait for more data
-                break;
-            }
-
-            // Extract the payload and remove it from the buffer
-            List<int> payload = accumulatedBuffer.sublist(8, 8 + payloadLength);
-            accumulatedBuffer.removeRange(0, 8 + payloadLength);
-
-            // Handle the payload for the session
-            Socks5Session session = sessions.putIfAbsent(sessionId, () {
-                return Socks5Session(sessionId, _masterConn, _sendToMasterInProtocol);
-            });
-
-            // Process the payload within the session
-            session.processSocks5Data(payload);
-        }
-    } catch (e) {
-      logCallback('Error processing data: $e');
-      _cleanupConnections();
-    }
-  }
-
-  Future<double> _performSpeedTest(String url) async {
+  Future<void> _performSpeedTest(List<int> payload) async {
+    String url = utf8.decode(payload);
     final stopwatch = Stopwatch()..start();
 
     try {
@@ -166,15 +159,14 @@ class TunSocks {
         final elapsedTime = stopwatch.elapsedMilliseconds / 1000; // in seconds
 
         // Calculate speed in Mbps
-        final speedMbps = (contentLength * 8) / (elapsedTime * 1000000); 
-        return speedMbps;
+        final speedMbps = (contentLength * 8) / (elapsedTime * 1000000);
+
+        _sendSpeedResult(speedMbps);
       } else {
-        print('Failed to test url: ${response.statusCode}');
-        return 0.0;
+        logCallback('Failed to test URL: ${response.statusCode}');
       }
     } catch (e) {
-      print('Error during speed test: $e');
-      return 0.0;
+      logCallback('Error during speed test: $e');
     }
   }
 
@@ -191,20 +183,40 @@ class TunSocks {
     ];
   }
 
-  void _sendToMasterInProtocol(int sessionId, List<int> data) async {
+  void _sendToMasterInProtocol(int sessionId, List<int> payload, {int packetType = dataPacket, int commandId = 0x00}) async {
     await _masterConnLock.synchronized(() async {
       if (_masterConn != null) {
-        List<int> header = _intToBytes(sessionId) + _intToBytes(data.length);
-        List<int> packet = header + data;
-        
+        final packet = [
+          packetType,                      // Packet Type (0x00 for data, 0x01 for command)
+          ..._intToBytes(sessionId),       // Session ID
+          commandId,                       // Command ID (default to 0x00 for data packets)
+          ..._intToBytes(payload.length),  // Payload Length
+          ...payload                       // Payload data
+        ];
         try {
           _masterConn?.add(packet);
           await _masterConn?.flush();
         } catch (e) {
-          print('Failed to send to master in protocol: $e');
+          print('Failed to send to master: $e');
         }
       }
     });
+  }
+
+  // Command packet example:
+  void _sendSpeedResult(double speedMbps) {
+    final payload = utf8.encode('$speedMbps');
+    _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: speedCheck);
+  }
+
+  void _sendVersionInfo() {
+    final payload = utf8.encode(slaveVersion);
+    _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: versionCheck);
+  }
+
+  // Data packet example:
+  void _sendDataPacket(int sessionId, List<int> data) {
+    _sendToMasterInProtocol(sessionId, data);
   }
 
   void stopTunnel() {
@@ -218,9 +230,7 @@ class TunSocks {
     _masterConnLock.synchronized(() async {
       _masterConn?.close();
     });
-    _masterConn?.close();
     _masterConn = null;
-    speedTestDone = false;
     currentState = ProxyState.disconnected;
   }
 }

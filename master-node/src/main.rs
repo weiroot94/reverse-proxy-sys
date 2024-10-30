@@ -11,9 +11,42 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 const KEEP_ALIVE_DURATION: u64 = 10;
 const MAX_BUF_SIZE: usize = 8192;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PacketType {
+    Data = 0x00,
+    Command = 0x01,
+}
+
+impl PacketType {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(PacketType::Data),
+            0x01 => Some(PacketType::Command),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommandType {
+    SpeedCheck = 0x01,
+    VersionCheck = 0x02,
+}
+
+impl CommandType {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(CommandType::SpeedCheck),
+            0x02 => Some(CommandType::VersionCheck),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Slave {
     ip_addr: String,
+    version: Option<String>,
     // Weight for round robin
     net_speed: f64,
     stream: Arc<AsyncMutex<TcpStream>>,
@@ -22,11 +55,12 @@ struct Slave {
 }
 
 impl Slave {
-    fn new(ip_addr: String, net_speed: f64, stream: TcpStream) -> (Self, mpsc::Receiver<(u32, Vec<u8>)>) {
+    fn new(ip_addr: String, stream: TcpStream) -> (Self, mpsc::Receiver<(u32, Vec<u8>)>) {
         let (tx, rx) = mpsc::channel(100);
         let slave = Self {
             ip_addr,
-            net_speed,
+            version: None,
+            net_speed: 0.0,
             stream: Arc::new(AsyncMutex::new(stream)),
             tx,
         };
@@ -138,6 +172,22 @@ impl ProxyManager {
         }
     }
 
+    async fn update_slave_speed(&self, slave_ip: &str, net_speed: f64) {
+        let mut slaves = self.slaves.lock().await;
+        if let Some(slave) = slaves.get_mut(slave_ip) {
+            slave.net_speed = net_speed;
+            info!("Updated net speed for {}: {} Mbps", slave_ip, net_speed);
+        }
+    }
+
+    async fn update_slave_version(&self, slave_ip: &str, version: String) {
+        let mut slaves = self.slaves.lock().await;
+        if let Some(slave) = slaves.get_mut(slave_ip) {
+            slave.version = Some(version.clone());
+            info!("Updated version for {}: {}", slave_ip, version);
+        }
+    }
+
     // Handle slave disconnection based on slave_recovery_mode
     async fn handle_slave_disconnection(&self, slave_ip: &str) {
         {
@@ -181,13 +231,56 @@ fn bytes_to_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(array)
 }
 
-// Prepend the session ID and the payload length
-fn build_frame(session_id: u32, data: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(8 + data.len());
-    frame.extend_from_slice(&session_id.to_be_bytes()); // 4 bytes for session ID
-    frame.extend_from_slice(&(data.len() as u32).to_be_bytes()); // 4 bytes for payload length
-    frame.extend_from_slice(data); // actual data
+fn build_command_frame(packet_type: PacketType, session_id: u32, command_type: Option<CommandType>, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(10 + payload.len());
+    frame.push(packet_type as u8);
+    frame.extend_from_slice(&session_id.to_be_bytes());
+    
+    if let Some(cmd) = command_type {
+        frame.push(cmd as u8);
+    } else {
+        frame.push(0x00);
+    }
+
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
     frame
+}
+
+fn build_speed_test_command(url: &str) -> Vec<u8> {
+    build_command_frame(PacketType::Command, 0, Some(CommandType::SpeedCheck), url.as_bytes())
+}
+
+fn build_version_check_command() -> Vec<u8> {
+    build_command_frame(PacketType::Command, 0, Some(CommandType::VersionCheck), &[])
+}
+
+fn build_data_frame(session_id: u32, payload: &[u8]) -> Vec<u8> {
+    build_command_frame(PacketType::Data, session_id, None, payload)
+}
+
+fn parse_header(buffer: &[u8]) -> (Option<PacketType>, u32, usize, Option<CommandType>) {
+    if buffer.len() < 10 {
+        return (None, 0, 0, None);
+    }
+
+    let packet_type = PacketType::from_u8(buffer[0]);
+    let session_id = bytes_to_u32(&buffer[1..5]);
+    let payload_len = u32::from_be_bytes([
+        buffer[6],
+        buffer[7],
+        buffer[8],
+        buffer[9],
+    ]) as usize;
+
+    // Check for CommandType if the packet is a command
+    let command_type = if packet_type == Some(PacketType::Command) {
+        CommandType::from_u8(buffer[5])
+    } else {
+        None
+    };
+
+    (packet_type, session_id, payload_len, command_type)
 }
 
 // Function to handle a single slave's I/O operations for all clients using it (multiplexing)
@@ -198,9 +291,26 @@ async fn handle_slave_io(
 ) -> Result<(), std::io::Error> {
     let mut buffer = [0u8; MAX_BUF_SIZE];
     let mut accumulated_buffer: Vec<u8> = Vec::new();
-    let mut header_read = false;
-    let mut expected_payload_len = 0;
-    let mut session_id = 0;
+
+    // Send SpeedCheck and VersionCheck commands after establishing connection
+    let speed_check_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
+    let version_check_command = build_version_check_command();
+
+    // Send commands concurrently by spawning async tasks
+    {
+        let slave_clone = slave.clone(); // Clone to move into async task
+        let send_speed_check = tokio::spawn(async move {
+            slave_clone.write_stream(&speed_check_command).await
+        });
+
+        let slave_clone = slave.clone(); // Another clone for version check
+        let send_version_check = tokio::spawn(async move {
+            slave_clone.write_stream(&version_check_command).await
+        });
+
+        // Await both tasks to ensure commands are sent before proceeding
+        let _ = tokio::try_join!(send_speed_check, send_version_check)?;
+    }
 
     loop {
         tokio::select! {
@@ -213,30 +323,53 @@ async fn handle_slave_io(
 
                 accumulated_buffer.extend_from_slice(&buffer[..len]);
 
-                // Process the incoming buffer
-                while accumulated_buffer.len() >= 8 {
-                    if !header_read && accumulated_buffer.len() >= 8 {
-                        session_id = bytes_to_u32(&accumulated_buffer[0..4]);
-                        expected_payload_len = u32::from_be_bytes([
-                            accumulated_buffer[4],
-                            accumulated_buffer[5],
-                            accumulated_buffer[6],
-                            accumulated_buffer[7],
-                        ]) as usize;
-                        header_read = true;
-                        accumulated_buffer.drain(0..8);  // Remove the header bytes
+                while accumulated_buffer.len() >= 10 {
+                    let (current_packet_type, session_id, payload_len, current_command_type) = parse_header(&accumulated_buffer);
+
+                    if current_packet_type.is_none() {
+                        break;
                     }
 
-                    if header_read && accumulated_buffer.len() >= expected_payload_len {
-                        // Extract the payload and route to the correct client
-                        let payload = accumulated_buffer.drain(0..expected_payload_len).collect::<Vec<u8>>();
-                        trace!("Slave -> Master: sid {}, size: {} bytes", session_id.clone(), expected_payload_len);
-                        proxy_manager.route_to_client(session_id, payload).await;
+                    // Ensure we have the entire payload before processing
+                    if accumulated_buffer.len() < 10 + payload_len {
+                        break;
+                    }
 
-                        header_read = false;
-                        expected_payload_len = 0;
-                    } else {
-                        break;  // Wait for more data
+                    // Remove the header from the buffer
+                    accumulated_buffer.drain(0..10);
+
+                    // Process the packet with the current_packet_type and current_command_type
+                    let payload = accumulated_buffer.drain(0..payload_len).collect::<Vec<u8>>();
+
+                    debug!("Processing packet from slave: {} | PacketType: {:?} | CommandType: {:?}", 
+                          slave.ip_addr, current_packet_type, current_command_type);
+
+                    match current_packet_type {
+                        Some(PacketType::Command) => {
+                            match current_command_type {
+                                Some(CommandType::SpeedCheck) => {
+                                    let speed_str = String::from_utf8(payload.clone()).unwrap_or_default();
+                                    if let Ok(speed) = speed_str.parse::<f64>() {
+                                        proxy_manager.update_slave_speed(&slave.ip_addr, speed).await;
+                                        info!("SpeedCheck response from slave: {} | Net speed: {} Mbps", slave.ip_addr, speed);
+                                    } else {
+                                        warn!("Failed to parse SpeedCheck response from slave: {}", slave.ip_addr);
+                                    }
+                                }
+                                Some(CommandType::VersionCheck) => {
+                                    let version = String::from_utf8(payload.clone()).unwrap_or_default();
+                                    proxy_manager.update_slave_version(&slave.ip_addr, version.clone()).await;
+                                    info!("VersionCheck response from slave: {} | Version: {}", slave.ip_addr, version);
+                                }
+                                None => error!("Unknown CommandType received from slave: {}", slave.ip_addr),
+                            }
+                        }
+                        Some(PacketType::Data) => {
+                            proxy_manager.route_to_client(session_id, payload).await;
+                        }
+                        None => {
+                            error!("Unknown PacketType received from slave: {}", slave.ip_addr);
+                        }
                     }
                 }
             }
@@ -244,7 +377,7 @@ async fn handle_slave_io(
             // Handle traffic from clients
             Some((client_session_id, client_data)) = cli_rx.recv() => {
                 trace!("Master -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
-                let frame = build_frame(client_session_id, &client_data);
+                let frame = build_data_frame(client_session_id, &client_data);
                 slave.write_stream(&frame).await?;
             }
         }
@@ -272,7 +405,6 @@ async fn handle_client_io(
         if let Some(client) = clients.get(&session_id) {
             client.clone() // Assuming Client is Clone
         } else {
-            warn!("Client not found for session ID {}", session_id);
             return Ok(()); // Exit if the client is not found
         }
     };
@@ -318,28 +450,6 @@ async fn handle_client_io(
     Ok(())
 }
 
-// Send a command to the slave to download a file and report back the download speed
-async fn send_speed_test_command(slave_stream: &mut TcpStream) -> Result<f64, Box<dyn std::error::Error>> {
-    let speed_test_url = "https://speed.cloudflare.com/__down?bytes=5000000";
-
-    // Send the speed test command to the slave
-    let command = format!("SPEED_TEST {}\n", speed_test_url);
-    slave_stream.write_all(command.as_bytes()).await?;
-
-    // Read the response from the slave (assuming the slave sends back the speed in Mbps)
-    let mut response = vec![0u8; 1024];
-    let bytes_read = slave_stream.read(&mut response).await?;
-    
-    // Parse the response (expecting a string like "SPEED 12.34\n")
-    let response_str = String::from_utf8_lossy(&response[..bytes_read]);
-    if let Some(speed_str) = response_str.strip_prefix("SPEED ") {
-        let download_speed_mbps: f64 = speed_str.trim().parse()?;
-        Ok(download_speed_mbps)
-    } else {
-        Err("Invalid response from slave".into())
-    }
-}
-
 async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Arc<ProxyManager>) -> Result<(), Box<dyn Error>> {
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
@@ -352,26 +462,12 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
 
         let raw_stream = slave_stream.into_std().unwrap();
         raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
-        let mut slave_stream = TcpStream::from_std(raw_stream).unwrap();
+        let slave_stream = TcpStream::from_std(raw_stream).unwrap();
 
         info!("New Slave {}:{}", slave_addr.ip(), slave_addr.port());
 
-		// Send a speed test request to the slave and measure the internet speed
-        let download_speed_mbps = match send_speed_test_command(&mut slave_stream).await {
-            Ok(speed) => speed,
-            Err(e) => {
-                error!("Failed to measure internet speed for slave {}: {}", slave_addr.ip(), e);
-                1.0
-            }
-        };
-
-        // Assign weight based on measured download speed
-        let weight = download_speed_mbps.round() as isize;
-
-        info!("Slave {} Weight: {}", slave_addr.ip(), weight);
-
         // Create a new Slave object
-        let (new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), weight as f64, slave_stream);
+        let (new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
 
         // Update ProxyManager with the new slave
         proxy_manager.slaves.lock().await.insert(new_slave.ip_addr.clone(), new_slave.clone());
