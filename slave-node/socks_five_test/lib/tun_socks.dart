@@ -32,6 +32,23 @@ Future<String> getOrCreateUUID() async {
   return uuid;
 }
 
+Future<String?> getLocalIpAddress() async {
+  try {
+    final interfaces = await NetworkInterface.list(
+      type: InternetAddressType.IPv4,
+      includeLinkLocal: false,
+    );
+    for (var interface in interfaces) {
+      for (var addr in interface.addresses) {
+        return addr.address;
+      }
+    }
+  } catch (e) {
+    print('Error getting IP address: $e');
+  }
+  return null;
+}
+
 class ProtocolPacket {
   final int sessionId;
   final int packetType;
@@ -81,6 +98,11 @@ class TunSocks {
   bool isManuallyStopped = false;
   final String slaveVersion = "1.0.0";
 
+  // Check Ip address change
+  String? _lastKnownIp;
+  Timer? _ipCheckTimer;
+  final Duration ipCheckInterval = Duration(seconds: 10);
+
   final Function(String) logCallback;
   final Function(bool) connectionStatusCallback;
 
@@ -105,6 +127,9 @@ class TunSocks {
       currentState = ProxyState.connected;
       connectionStatusCallback(true);
 
+      // Start monitoring IP changes
+      _startIpMonitoring();
+
       _masterConn!
           .transform(StreamTransformer.fromBind((stream) => MasterTrafficParser().bind(stream)))
           .listen((packet) async {
@@ -128,6 +153,17 @@ class TunSocks {
       logCallback('Failed to connect to master: $e');
       _handleDisconnection();
     }
+  }
+
+  void _startIpMonitoring() {
+    _ipCheckTimer = Timer.periodic(ipCheckInterval, (timer) async {
+      final currentIp = await getLocalIpAddress();
+      if (currentIp != null && currentIp != _lastKnownIp) {
+        logCallback('IP change detected: $_lastKnownIp -> $currentIp');
+        _lastKnownIp = currentIp;
+        _handleDisconnection();
+      }
+    });
   }
 
   Future<void> _handleCommand(int? commandId, List<int> payload) async {
@@ -247,6 +283,7 @@ class TunSocks {
 
   void stopTunnel() {
     isManuallyStopped = true;
+    _ipCheckTimer?.cancel();
     _cleanupConnections();
     connectionStatusCallback(false);
     logCallback('Proxy server stopped.');
