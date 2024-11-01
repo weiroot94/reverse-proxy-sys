@@ -1,8 +1,5 @@
 import 'package:flutter/material.dart';
-import 'dart:io';
-import 'dart:typed_data';
-
-import 'tun_socks.dart';
+import 'package:tun_socks/tun_socks.dart';
 
 void main() {
   runApp(MyApp());
@@ -23,42 +20,41 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
-  late TunSocks _tunSocks;
-  String _connectionStatus = "Disconnected";
   String _logMessages = "";
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _tunSocks = TunSocks(
-      host: '188.245.104.81',
-      port: 8000,
-      logCallback: (message) {
-        setState(() {
-          _logMessages += '$message\n';
-        });
-      },
-      connectionStatusCallback: (connected) {
-        setState(() {
-          _connectionStatus = connected ? "Connected" : "Disconnected";
-        });
-      },
-    );
+
+    // Listen to the status stream from the tun_socks package
+    statusStream.listen((message) {
+      setState(() {
+        _logMessages += '$message\n';
+      });
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _tunSocks.stopTunnel();
+    stopTunnel();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.detached) {
-      _tunSocks.stopTunnel();
+      stopTunnel();
     }
+  }
+
+  void _startProxy() {
+    startTunnel('188.245.104.81', 8000);
+  }
+
+  void _stopProxy() {
+    stopTunnel();
   }
 
   @override
@@ -72,28 +68,6 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            // Connection status bar
-            Container(
-              padding: const EdgeInsets.symmetric(vertical: 10.0, horizontal: 16.0),
-              decoration: BoxDecoration(
-                color: _connectionStatus == "Connected" ? Colors.green[100] : Colors.red[100],
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    'Status: $_connectionStatus',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                  Icon(
-                    _connectionStatus == "Connected" ? Icons.check_circle : Icons.cancel,
-                    color: _connectionStatus == "Connected" ? Colors.green : Colors.red,
-                  ),
-                ],
-              ),
-            ),
-            SizedBox(height: 40),
             // Log Messages
             Expanded(
               child: Container(
@@ -120,9 +94,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
                 ElevatedButton(
-                  onPressed: _tunSocks.currentState == ProxyState.connected
-                      ? _tunSocks.stopTunnel
-                      : null,
+                  onPressed: _stopProxy,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.red,
                     padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
@@ -132,14 +104,12 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
                     children: [
                       Icon(Icons.stop),
                       SizedBox(width: 8),
-                      Text('Stop Proxy'),
+                      Text('Stop'),
                     ],
                   ),
                 ),
                 ElevatedButton(
-                  onPressed: _tunSocks.currentState == ProxyState.disconnected
-                      ? _tunSocks.startTunnel
-                      : null,
+                  onPressed: _startProxy,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.green,
                     padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
@@ -149,7 +119,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
                     children: [
                       Icon(Icons.play_arrow),
                       SizedBox(width: 8),
-                      Text('Start Proxy'),
+                      Text('Start'),
                     ],
                   ),
                 ),

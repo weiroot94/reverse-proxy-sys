@@ -1,9 +1,6 @@
 import 'dart:io';
-import 'package:logging/logging.dart';
 import 'package:http/http.dart' as http;
 import 'package:synchronized/synchronized.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
 import 'dart:async';
 import 'dart:typed_data';
 import 'dart:convert';
@@ -18,36 +15,6 @@ const int commandPacket = 0x01;
 // Command ID constants
 const int speedCheck = 0x01;
 const int versionCheck = 0x02;
-const int uuidCheck = 0x03;
-
-Future<String> getOrCreateUUID() async {
-  final prefs = await SharedPreferences.getInstance();
-  String? uuid = prefs.getString('slaveUUID');
-
-  if (uuid == null) {
-    uuid = Uuid().v4(); // Generate a new UUID
-    await prefs.setString('slaveUUID', uuid);
-  }
-
-  return uuid;
-}
-
-Future<String?> getLocalIpAddress() async {
-  try {
-    final interfaces = await NetworkInterface.list(
-      type: InternetAddressType.IPv4,
-      includeLinkLocal: false,
-    );
-    for (var interface in interfaces) {
-      for (var addr in interface.addresses) {
-        return addr.address;
-      }
-    }
-  } catch (e) {
-    print('Error getting IP address: $e');
-  }
-  return null;
-}
 
 class ProtocolPacket {
   final int sessionId;
@@ -90,6 +57,8 @@ class MasterTrafficParser extends StreamTransformerBase<List<int>, ProtocolPacke
 class TunSocks {
   final String host;
   final int port;
+  final StreamController<String> statusController;
+
   late Socket? _masterConn;
   final _masterConnLock = Lock();
   ProxyState currentState = ProxyState.disconnected;
@@ -99,35 +68,32 @@ class TunSocks {
   final String slaveVersion = "1.0.0";
 
   // Check Ip address change
-  String? _lastKnownIp;
+  List<String> _lastKnownIps = [];
   Timer? _ipCheckTimer;
   final Duration ipCheckInterval = Duration(seconds: 10);
-
-  final Function(String) logCallback;
-  final Function(bool) connectionStatusCallback;
 
   TunSocks({
     required this.host,
     required this.port,
-    required this.logCallback,
-    required this.connectionStatusCallback,
+    required this.statusController,
   });
 
   Future<void> startTunnel() async {
-    if (currentState != ProxyState.disconnected) return;
+    if (currentState != ProxyState.disconnected) {
+        return;
+    }
 
     currentState = ProxyState.connecting;
     isManuallyStopped = false;
-    logCallback('Connecting to master node...');
-    connectionStatusCallback(false);
 
     try {
-      _masterConn = await Socket.connect(host, port);
-      logCallback('Connected to master node: $host:$port');
-      currentState = ProxyState.connected;
-      connectionStatusCallback(true);
+      _masterConn = await Socket.connect(host, port).timeout(Duration(seconds: 5));
 
-      // Start monitoring IP changes
+      statusController.add('Connected to master node at $host:$port');
+      currentState = ProxyState.connected;
+
+      // Fetch initial IPs and start IP monitoring
+      _lastKnownIps = await _getLocalIpAddresses();
       _startIpMonitoring();
 
       _masterConn!
@@ -144,26 +110,53 @@ class TunSocks {
               await _handleCommand(packet.commandId, packet.payload);
             }
           },
-          onDone: _handleDisconnection,
+          onDone: () {
+            statusController.add('Connection to master was closed.');
+            _handleDisconnection();
+            },
           onError: (error) {
-            logCallback('Master connection error: $error');
+            statusController.add('Master connection error: $error');
             _handleDisconnection();
           });
     } catch (e) {
-      logCallback('Failed to connect to master: $e');
+      statusController.add('Failed to connect to master: $e');
       _handleDisconnection();
     }
   }
 
   void _startIpMonitoring() {
     _ipCheckTimer = Timer.periodic(ipCheckInterval, (timer) async {
-      final currentIp = await getLocalIpAddress();
-      if (currentIp != null && currentIp != _lastKnownIp) {
-        logCallback('IP change detected: $_lastKnownIp -> $currentIp');
-        _lastKnownIp = currentIp;
+      final currentIps = await _getLocalIpAddresses();
+      if (!_listEquals(_lastKnownIps, currentIps)) {
+        statusController.add('IP address change detected: $_lastKnownIps -> $currentIps');
+        _lastKnownIps = currentIps;
         _handleDisconnection();
       }
     });
+  }
+
+  Future<List<String>> _getLocalIpAddresses() async {
+    List<String> ips = [];
+    try {
+      final interfaces = await NetworkInterface.list(
+          type: InternetAddressType.IPv4, includeLinkLocal: false);
+      for (var interface in interfaces) {
+        for (var addr in interface.addresses) {
+          ips.add(addr.address);
+        }
+      }
+    } catch (e) {
+      statusController.add('Error obtaining IP addresses: $e');
+    }
+    return ips;
+  }
+
+  bool _listEquals(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 
   Future<void> _handleCommand(int? commandId, List<int> payload) async {
@@ -174,18 +167,13 @@ class TunSocks {
       case versionCheck:
         _sendVersionInfo();
         break;
-      case uuidCheck:
-        final uuid = await getOrCreateUUID();
-        _sendUUIDInfo(uuid);
-        break;
       default:
-        logCallback('Unknown command received');
+        statusController.add('Unknown command received');
     }
   }
 
   void _handleDisconnection() {
     currentState = ProxyState.disconnected;
-    connectionStatusCallback(false);
     _cleanupConnections();
 
     if (!isManuallyStopped) {
@@ -199,7 +187,8 @@ class TunSocks {
         : Duration(seconds: 5);
     retryAttempts++;
     await Future.delayed(retryDelay);
-    logCallback('Retrying connection... Attempt $retryAttempts');
+
+    statusController.add('Retrying connection... Attempt $retryAttempts');
     startTunnel();
   }
 
@@ -220,10 +209,10 @@ class TunSocks {
 
         _sendSpeedResult(speedMbps);
       } else {
-        logCallback('Failed to test URL: ${response.statusCode}');
+        statusController.add('Failed to test URL: ${response.statusCode}');
       }
     } catch (e) {
-      logCallback('Error during speed test: $e');
+      statusController.add('Error during speed test: $e');
     }
   }
 
@@ -254,7 +243,7 @@ class TunSocks {
           _masterConn?.add(packet);
           await _masterConn?.flush();
         } catch (e) {
-          print('Failed to send to master: $e');
+          statusController.add('Failed to send to master: $e');
         }
       }
     });
@@ -271,11 +260,6 @@ class TunSocks {
     _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: versionCheck);
   }
 
-  void _sendUUIDInfo(String uuid) {
-    final payload = utf8.encode(uuid);
-    _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: uuidCheck);
-  }
-
   // Data packet example:
   void _sendDataPacket(int sessionId, List<int> data) {
     _sendToMasterInProtocol(sessionId, data);
@@ -285,8 +269,7 @@ class TunSocks {
     isManuallyStopped = true;
     _ipCheckTimer?.cancel();
     _cleanupConnections();
-    connectionStatusCallback(false);
-    logCallback('Proxy server stopped.');
+    statusController.add('Proxy server stopped.');
   }
 
   void _cleanupConnections() {
