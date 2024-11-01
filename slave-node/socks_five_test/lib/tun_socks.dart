@@ -2,9 +2,12 @@ import 'dart:io';
 import 'package:logging/logging.dart';
 import 'package:http/http.dart' as http;
 import 'package:synchronized/synchronized.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import 'dart:async';
 import 'dart:typed_data';
 import 'dart:convert';
+
 import 'socks5_session.dart';
 
 enum ProxyState { disconnected, connecting, connected, }
@@ -15,6 +18,19 @@ const int commandPacket = 0x01;
 // Command ID constants
 const int speedCheck = 0x01;
 const int versionCheck = 0x02;
+const int uuidCheck = 0x03;
+
+Future<String> getOrCreateUUID() async {
+  final prefs = await SharedPreferences.getInstance();
+  String? uuid = prefs.getString('slaveUUID');
+
+  if (uuid == null) {
+    uuid = Uuid().v4(); // Generate a new UUID
+    await prefs.setString('slaveUUID', uuid);
+  }
+
+  return uuid;
+}
 
 class ProtocolPacket {
   final int sessionId;
@@ -115,14 +131,19 @@ class TunSocks {
   }
 
   Future<void> _handleCommand(int? commandId, List<int> payload) async {
-    if (commandId == speedCheck) {
-      logCallback('Received command: SPEED_TEST');
-      await _performSpeedTest(payload);
-    } else if (commandId == versionCheck) {
-      logCallback('Received command: VERSION_INFO');
-      _sendVersionInfo();
-    } else {
-      logCallback('Unknown command received');
+    switch (commandId) {
+      case speedCheck:
+        await _performSpeedTest(payload);
+        break;
+      case versionCheck:
+        _sendVersionInfo();
+        break;
+      case uuidCheck:
+        final uuid = await getOrCreateUUID();
+        _sendUUIDInfo(uuid);
+        break;
+      default:
+        logCallback('Unknown command received');
     }
   }
 
@@ -212,6 +233,11 @@ class TunSocks {
   void _sendVersionInfo() {
     final payload = utf8.encode(slaveVersion);
     _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: versionCheck);
+  }
+
+  void _sendUUIDInfo(String uuid) {
+    final payload = utf8.encode(uuid);
+    _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: uuidCheck);
   }
 
   // Data packet example:
