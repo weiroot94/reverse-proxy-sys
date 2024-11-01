@@ -31,7 +31,6 @@ impl PacketType {
 enum CommandType {
     SpeedCheck = 0x01,
     VersionCheck = 0x02,
-    UUIDCheck = 0x03,
 }
 
 impl CommandType {
@@ -39,7 +38,6 @@ impl CommandType {
         match value {
             0x01 => Some(CommandType::SpeedCheck),
             0x02 => Some(CommandType::VersionCheck),
-            0x03 => Some(CommandType::UUIDCheck),
             _ => None,
         }
     }
@@ -49,7 +47,6 @@ impl CommandType {
 struct Slave {
     ip_addr: String,
     version: Option<String>,
-    uuid: Option<String>,
     // Weight for round robin
     net_speed: f64,
     stream: Arc<AsyncMutex<TcpStream>>,
@@ -63,7 +60,6 @@ impl Slave {
         let slave = Self {
             ip_addr,
             version: None,
-            uuid: None,
             net_speed: 0.0,
             stream: Arc::new(AsyncMutex::new(stream)),
             tx,
@@ -190,13 +186,6 @@ impl ProxyManager {
         }
     }
 
-    async fn update_slave_uuid(&self, slave_ip: &str, uuid: String) {
-        let mut slaves = self.slaves.lock().await;
-        if let Some(slave) = slaves.get_mut(slave_ip) {
-            slave.uuid = Some(uuid.clone());
-        }
-    }
-
     // Handle slave disconnection based on slave_recovery_mode
     async fn handle_slave_disconnection(&self, slave_ip: &str) {
         {
@@ -264,10 +253,6 @@ fn build_version_check_command() -> Vec<u8> {
     build_command_frame(PacketType::Command, 0, Some(CommandType::VersionCheck), &[])
 }
 
-fn build_uuid_check_command() -> Vec<u8> {
-    build_command_frame(PacketType::Command, 0, Some(CommandType::UUIDCheck), &[])
-}
-
 fn build_data_frame(session_id: u32, payload: &[u8]) -> Vec<u8> {
     build_command_frame(PacketType::Data, session_id, None, payload)
 }
@@ -308,7 +293,6 @@ async fn handle_slave_io(
     // Prepare the commands
     let speed_check_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
     let version_check_command = build_version_check_command();
-    let uuid_check_command = build_uuid_check_command();
 
     // Send commands concurrently by spawning async tasks
     {
@@ -322,13 +306,8 @@ async fn handle_slave_io(
             slave_clone.write_stream(&version_check_command).await
         });
 
-        let slave_clone = slave.clone();
-        let send_uuid_check = tokio::spawn(async move {
-            slave_clone.write_stream(&uuid_check_command).await
-        });
-
         // Await both tasks to ensure commands are sent before proceeding
-        let _ = tokio::try_join!(send_speed_check, send_version_check, send_uuid_check)?;
+        let _ = tokio::try_join!(send_speed_check, send_version_check)?;
     }
 
     loop {
@@ -379,11 +358,6 @@ async fn handle_slave_io(
                                     let version = String::from_utf8(payload.clone()).unwrap_or_default();
                                     proxy_manager.update_slave_version(&slave.ip_addr, version.clone()).await;
                                     info!("Slave: {} | Version: {}", slave.ip_addr, version);
-                                }
-                                Some(CommandType::UUIDCheck) => {
-                                    let uuid = String::from_utf8(payload.clone()).unwrap_or_default();
-                                    proxy_manager.update_slave_uuid(&slave.ip_addr, uuid.clone()).await;
-                                    info!("Slave: {} | UUID: {}", slave.ip_addr, uuid);
                                 }
                                 None => error!("Unknown CommandType received from slave: {}", slave.ip_addr),
                             }
