@@ -1,0 +1,13 @@
+targets:
+  $default:
+    builders:
+      tun_socks|version_builder:
+        generate_for:
+          - lib/src/version.dart
+builders:
+  tun_socks|version_builder:
+    import: "package:tun_socks/src/version_generator.dart"
+    builder_factories: ["versionBuilderFactory"]
+    build_extensions: {".dart": [".g.dart"]}
+    auto_apply: root_package
+    build_to: source

@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'dart:convert';
 
 import 'socks5_session.dart';
+import 'version.dart';
 
 enum ProxyState { disconnected, connecting, connected, }
 
@@ -65,7 +66,8 @@ class TunSocks {
   int retryAttempts = 0;
   List<int> accumulatedBuffer = [];
   bool isManuallyStopped = false;
-  final String slaveVersion = "1.0.0";
+  
+  String get slaveVersion => packageVersion;
 
   // Check Ip address change
   List<String> _lastKnownIps = [];
