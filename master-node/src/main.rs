@@ -3,7 +3,6 @@ use std::error::Error;
 use log::{trace, debug, info, warn, error, LevelFilter};
 use simple_logger::SimpleLogger;
 use getopts::Options;
-use net2::TcpStreamExt;
 use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, net::{TcpListener, TcpStream}};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -111,26 +110,26 @@ struct ProxyManager {
 }
 
 impl ProxyManager {
-    // Get an available slave stream using weighted round-robin
-    async fn get_available_slave_ip(&self, client_ip: &String) -> Option<String> {
+    // Get tx of avaiable Slave using weighted round-robin
+    async fn get_available_slave_tx(&self, client_ip: &String) -> Option<mpsc::Sender<(u32, Vec<u8>)>> {
         let mut cli_ip_to_slave = self.cli_ip_to_slave.lock().await;
-        let slave_list = self.slaves.lock().await;
+        let slaves = self.slaves.lock().await;
 
         // Mode 1: Assign the same slave to clients from the same IP
         if self.client_assign_mode == 1 {
             // Mode 1: Assign the same slave to clients from the same IP
             if let Some(slave_ip) = cli_ip_to_slave.get(client_ip) {
-                return Some(slave_ip.clone());
+                return slaves.get(slave_ip).map(|slave| slave.tx.clone());
             }
         }
 
         let mut total_weight = 0.0;
-        let available_slaves: Vec<_> = slave_list.iter()
-            .filter_map(|(ip, slave)| {
+        let available_slaves: Vec<_> = slaves.values()
+            .filter_map(|slave| {
                 let weight = slave.net_speed;
                 if weight > 0.0 {
                     total_weight += weight;
-                    Some((ip, weight))
+                    Some((slave, weight))
                 } else {
                     None
                 }
@@ -144,12 +143,13 @@ impl ProxyManager {
         // Weighted round-robin selection
         if total_weight > 0.0 {
             let mut random_weight: f64 = rand::random::<f64>() * total_weight;
-            for (ip, weight) in available_slaves {
+            for (slave, weight) in available_slaves {
                 if random_weight < weight {
+                    // In sticky mode, save the selected slave's IP for future requests from this client
                     if self.client_assign_mode == 1 {
-                        cli_ip_to_slave.insert(client_ip.clone(), ip.to_string());
+                        cli_ip_to_slave.insert(client_ip.clone(), slave.ip_addr.clone());
                     }
-                    return Some(ip.to_string());
+                    return Some(slave.tx.clone()); // Return only the tx channel of the selected slave
                 }
                 random_weight -= weight;
             }
@@ -186,8 +186,9 @@ impl ProxyManager {
         }
     }
 
-    // Handle slave disconnection based on slave_recovery_mode
     async fn handle_slave_disconnection(&self, slave_ip: &str) {
+        info!("Slave {} disconnected", slave_ip);
+
         {
             let mut slaves = self.slaves.lock().await;
 
@@ -198,19 +199,6 @@ impl ProxyManager {
                 return;
             }
         }
-
-        if self.slave_recovery_mode == 1 {
-            info!("Waiting for slave {} to recover", slave_ip);
-            // In this mode, we simply wait for the slave to reconnect
-            // Recovery logic should be handled in the connection loop
-        } else if self.slave_recovery_mode == 2 {
-            let mut ip_to_slave_map = self.cli_ip_to_slave.lock().await;
-
-            // Remove all IPs that were mapped to the disconnected slave
-            ip_to_slave_map.retain(|_, mapped_slave_ip| mapped_slave_ip != slave_ip);
-        }
-
-        info!("Slave {} disconnected", slave_ip);
     }
 }
 
@@ -381,10 +369,7 @@ async fn handle_slave_io(
         }
     }
 
-    // Slave recovery is only available when proxy stick mode
-    if proxy_manager.client_assign_mode == 1 {
-        proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
-    }
+    proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
     
     Ok(())
 }
@@ -392,22 +377,15 @@ async fn handle_slave_io(
 // Function to handle traffic between a client and the slave
 async fn handle_client_io(
     session_id: u32,
+    client: Client,
     slave_tx: mpsc::Sender<(u32, Vec<u8>)>,
     mut client_rx: mpsc::Receiver<Vec<u8>>,
     proxy_manager: Arc<ProxyManager>,
 ) -> Result<(), std::io::Error> {
+    // Add client session
+    proxy_manager.clients.lock().await.insert(session_id, client.clone());
+
     let mut client_buffer = [0u8; MAX_BUF_SIZE];
-
-    let client = {
-        let clients = proxy_manager.clients.lock().await;
-        if let Some(client) = clients.get(&session_id) {
-            client.clone() // Assuming Client is Clone
-        } else {
-            return Ok(()); // Exit if the client is not found
-        }
-    };
-
-    // Lock the receiver
     let mut cli_stream = client.stream.lock().await;
 
     // Main loop to handle continuous traffic between client and slave
@@ -436,10 +414,7 @@ async fn handle_client_io(
     }
 
     // Cleanup after the session ends
-    {
-        let mut clients = proxy_manager.clients.lock().await;
-        clients.remove(&session_id);
-    }
+    proxy_manager.clients.lock().await.remove(&session_id);
 
     // Close the client stream
     debug!("Closing client stream for session ID {}.", session_id);
@@ -457,10 +432,6 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
             }
             Ok(p) => p,
         };
-
-        let raw_stream = slave_stream.into_std().unwrap();
-        raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
-        let slave_stream = TcpStream::from_std(raw_stream).unwrap();
 
         info!("New Slave {}:{}", slave_addr.ip(), slave_addr.port());
 
@@ -509,6 +480,7 @@ async fn main() -> io::Result<()>  {
                 "slave_recovery",
                 "Set the slave recovery mode: wait (1) or reconnect (2). Only available when proxy_mode=stick",
                 "MODE");
+
     opts.optopt("v",
                 "verbosity",
                 "Set the verbosity level (trace, debug, info, warn, error)",
@@ -635,33 +607,18 @@ async fn main() -> io::Result<()>  {
 
             debug!("New Client: {}", client_addr.ip());
 
-			// Generate a new session ID for this client
-			let session_id = rand::random::<u32>();
-
             // Retrieve an available slave stream
             let client_ip = client_addr.ip().to_string();
-            if let Some(slave_ip) = proxy_manager.get_available_slave_ip(&client_ip).await {
-                // Lock the incoming client stream
-                let raw_stream = client_stream.into_std().unwrap();
-                raw_stream.set_keepalive(Some(std::time::Duration::from_secs(KEEP_ALIVE_DURATION))).unwrap();
-                let client_stream = Arc::new(AsyncMutex::new(TcpStream::from_std(raw_stream).unwrap()));
-
-                let slave = {
-                    let slaves = proxy_manager.slaves.lock().await;
-                    slaves.get(&slave_ip).unwrap().clone()
-                };
+            if let Some(slave_tx) = proxy_manager.get_available_slave_tx(&client_ip).await {
+                let client_stream = Arc::new(AsyncMutex::new(client_stream));
+			    let session_id = rand::random::<u32>();
 
                 let (client_tx, client_rx) = mpsc::channel(100);
-
                 let client = Client::new(client_stream.clone(), client_tx);
     
-                proxy_manager.clients.lock().await.insert(session_id, client);
-
                 // Spawn a task to handle traffic between the client and the assigned slave
                 let proxy_manager_clone = Arc::clone(&proxy_manager);
-                tokio::spawn(handle_client_io(session_id, slave.tx.clone(), client_rx, proxy_manager_clone));
-            } else {
-                warn!("No available slave for client with session ID {}", session_id);
+                tokio::spawn(handle_client_io(session_id, client, slave_tx, client_rx, proxy_manager_clone));
             }
         }
     } else {
