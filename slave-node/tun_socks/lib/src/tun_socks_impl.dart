@@ -58,7 +58,6 @@ class MasterTrafficParser extends StreamTransformerBase<List<int>, ProtocolPacke
 class TunSocks {
   final String host;
   final int port;
-  final StreamController<String> statusController;
 
   late Socket? _masterConn;
   final _masterConnLock = Lock();
@@ -77,7 +76,6 @@ class TunSocks {
   TunSocks({
     required this.host,
     required this.port,
-    required this.statusController,
   });
 
   Future<void> startTunnel() async {
@@ -91,7 +89,7 @@ class TunSocks {
     try {
       _masterConn = await Socket.connect(host, port).timeout(Duration(seconds: 5));
 
-      statusController.add('Connected to master node at $host:$port');
+      print('Connected to master node at $host:$port');
       currentState = ProxyState.connected;
 
       // Fetch initial IPs and start IP monitoring
@@ -113,15 +111,15 @@ class TunSocks {
             }
           },
           onDone: () {
-            statusController.add('Connection to master was closed.');
+            print('Connection to master was closed.');
             _handleDisconnection();
             },
           onError: (error) {
-            statusController.add('Master connection error: $error');
+            print('Master connection error: $error');
             _handleDisconnection();
           });
     } catch (e) {
-      statusController.add('Failed to connect to master: $e');
+      print('Failed to connect to master: $e');
       _handleDisconnection();
     }
   }
@@ -130,7 +128,7 @@ class TunSocks {
     _ipCheckTimer = Timer.periodic(ipCheckInterval, (timer) async {
       final currentIps = await _getLocalIpAddresses();
       if (!_listEquals(_lastKnownIps, currentIps)) {
-        statusController.add('IP address change detected: $_lastKnownIps -> $currentIps');
+        print('IP address change detected: $_lastKnownIps -> $currentIps');
         _lastKnownIps = currentIps;
         _handleDisconnection();
       }
@@ -148,7 +146,7 @@ class TunSocks {
         }
       }
     } catch (e) {
-      statusController.add('Error obtaining IP addresses: $e');
+      print('Error obtaining IP addresses: $e');
     }
     return ips;
   }
@@ -170,7 +168,7 @@ class TunSocks {
         _sendVersionInfo();
         break;
       default:
-        statusController.add('Unknown command received');
+        print('Unknown command received');
     }
   }
 
@@ -190,7 +188,7 @@ class TunSocks {
     retryAttempts++;
     await Future.delayed(retryDelay);
 
-    statusController.add('Retrying connection... Attempt $retryAttempts');
+    print('Retrying connection... Attempt $retryAttempts');
     startTunnel();
   }
 
@@ -211,10 +209,10 @@ class TunSocks {
 
         _sendSpeedResult(speedMbps);
       } else {
-        statusController.add('Failed to test URL: ${response.statusCode}');
+        print('Failed to test URL: ${response.statusCode}');
       }
     } catch (e) {
-      statusController.add('Error during speed test: $e');
+      print('Error during speed test: $e');
     }
   }
 
@@ -245,7 +243,7 @@ class TunSocks {
           _masterConn?.add(packet);
           await _masterConn?.flush();
         } catch (e) {
-          statusController.add('Failed to send to master: $e');
+          print('Failed to send to master: $e');
         }
       }
     });
@@ -271,7 +269,7 @@ class TunSocks {
     isManuallyStopped = true;
     _ipCheckTimer?.cancel();
     _cleanupConnections();
-    statusController.add('Proxy server stopped.');
+    print('Proxy server stopped.');
   }
 
   void _cleanupConnections() {

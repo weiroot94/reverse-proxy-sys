@@ -1,133 +1,114 @@
+import 'dart:async';
+import 'dart:ui';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:tun_socks/tun_socks.dart';
 
-void main() {
-  runApp(MyApp());
+@pragma('vm:entry-point')
+Future<void> onStart(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
+
+  _startTunnel();
+  //DO NOT REMOVE THE TIMER BECAUSE THIS WATCHDOG IS ALSO PRESENT IN THE PRODUCTION APP
+  Timer.periodic(const Duration(seconds: 60), (timer) async {
+    //- the internal state of the lib must check if it is needed to start the tunnel or do nothing when successfully connected here
+    _startTunnel();
+  });
+}
+
+_startTunnel()
+{
+  debugPrint("start_tunnel_called");
+  startTunnel('188.245.104.81', 8000);
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await _initializeBackgroundService();
+
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      home: MyHomePage(),
+      title: 'Flutter Demo',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+      ),
+      home: const MyHomePage(title: 'Flutter Demo Home Page'),
     );
   }
 }
 
 class MyHomePage extends StatefulWidget {
+  const MyHomePage({super.key, required this.title});
+
+  final String title;
+
   @override
-  _MyHomePageState createState() => _MyHomePageState();
+  State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
-  String _logMessages = "";
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-
-    // Listen to the status stream from the tun_socks package
-    statusStream.listen((message) {
-      setState(() {
-        _logMessages += '$message\n';
-      });
-    });
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    stopTunnel();
-    super.dispose();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.detached) {
-      stopTunnel();
-    }
-  }
-
-  void _startProxy() {
-    startTunnel('188.245.104.81', 8000);
-  }
-
-  void _stopProxy() {
-    stopTunnel();
-  }
+class _MyHomePageState extends State<MyHomePage> {
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text('SOCKS5 Reverse Proxy'),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
+      body: Center(
+
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            // Log Messages
-            Expanded(
-              child: Container(
-                padding: const EdgeInsets.all(12.0),
-                decoration: BoxDecoration(
-                  color: Colors.grey[200],
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: SingleChildScrollView(
-                  child: Container(
-                    width: MediaQuery.of(context).size.width * 0.7,
-                    child: Text(
-                      _logMessages,
-                      style: TextStyle(fontSize: 14),
-                      textAlign: TextAlign.left,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            SizedBox(height: 20),
-            // Action Buttons
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                ElevatedButton(
-                  onPressed: _stopProxy,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red,
-                    padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
-                    textStyle: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(Icons.stop),
-                      SizedBox(width: 8),
-                      Text('Stop'),
-                    ],
-                  ),
-                ),
-                ElevatedButton(
-                  onPressed: _startProxy,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.green,
-                    padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
-                    textStyle: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(Icons.play_arrow),
-                      SizedBox(width: 8),
-                      Text('Start'),
-                    ],
-                  ),
-                ),
-              ],
-            ),
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Text("Read the logs while debugging or via logcat when released")
           ],
         ),
       ),
+
     );
   }
+}
+
+Future<void> _initializeBackgroundService() async {
+
+  //PackageInfo packageInfo = await PackageInfo.fromPlatform();
+
+  final service = FlutterBackgroundService();
+
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      autoStartOnBoot: true,
+      // this will executed when app is in foreground or background in separated isolate
+      onStart: onStart,
+      // auto start service
+      autoStart: true,
+      isForegroundMode: true,
+      initialNotificationTitle: "", //"caching"
+      //initialNotificationTitle: "${packageInfo.appName} caching",
+      initialNotificationContent: "",
+      // notificationChannelId: notificationChannelId,
+      // foregroundServiceNotificationId: notificationId,
+
+    ),
+    iosConfiguration: IosConfiguration(
+      // auto start service
+      autoStart: false,
+      // this will executed when app is in foreground in separated isolate
+      onForeground: onStart,
+      // you have to enable background fetch capability on xcode project
+      onBackground: onIosBackground,
+    ),
+  );
+}
+
+bool onIosBackground(ServiceInstance service) {
+  WidgetsFlutterBinding.ensureInitialized();
+  // print('FLUTTER BACKGROUND FETCH');
+  return true;
 }

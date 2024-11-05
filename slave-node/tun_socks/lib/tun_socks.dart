@@ -6,19 +6,15 @@ import 'src/tun_socks_impl.dart';
 // Singleton instance of TunSocks
 TunSocks? _tunnelInstance;
 
-// Global StreamController to manage status messages consistently
-final _statusController = StreamController<String>.broadcast();
-
-/// Exposes a stream of status messages that remains active.
-Stream<String> get statusStream => _statusController.stream;
-
 /// Starts the tunnel with the given [masterAddress] and [port].
+/// Checks connection status to avoid unnecessary reconnections.
 Future<void> startTunnel(String masterAddress, int port) async {
-  _tunnelInstance ??= TunSocks(
-    host: masterAddress,
-    port: port,
-    statusController: _statusController,
-  );
+  if (_tunnelInstance == null) {
+    _tunnelInstance = TunSocks(
+      host: masterAddress,
+      port: port,
+    );
+  }
   await _tunnelInstance!.startTunnel();
 }
 
