@@ -4,6 +4,7 @@ use log::{trace, debug, info, warn, error, LevelFilter};
 use simple_logger::SimpleLogger;
 use getopts::Options;
 use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, net::{TcpListener, TcpStream}};
+use tokio::time::{self, Duration, Instant};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -30,6 +31,7 @@ impl PacketType {
 enum CommandType {
     SpeedCheck = 0x01,
     VersionCheck = 0x02,
+    Heartbeat = 0x03,
 }
 
 impl CommandType {
@@ -37,6 +39,7 @@ impl CommandType {
         match value {
             0x01 => Some(CommandType::SpeedCheck),
             0x02 => Some(CommandType::VersionCheck),
+            0x03 => Some(CommandType::Heartbeat),
             _ => None,
         }
     }
@@ -51,6 +54,8 @@ struct Slave {
     stream: Arc<AsyncMutex<TcpStream>>,
     // Sender to receive data from clients
     tx: mpsc::Sender<(u32, Vec<u8>)>,
+    // Track the last successful heartbeat time
+    last_seen: Arc<AsyncMutex<Instant>>,
 }
 
 impl Slave {
@@ -62,6 +67,7 @@ impl Slave {
             net_speed: 0.0,
             stream: Arc::new(AsyncMutex::new(stream)),
             tx,
+            last_seen: Arc::new(AsyncMutex::new(Instant::now())),
         };
         (slave, rx)
     }
@@ -79,6 +85,11 @@ impl Slave {
         stream.flush().await?;
         Ok(())
     }
+
+    async fn update_last_seen(&self) {
+        let mut last_seen = self.last_seen.lock().await;
+        *last_seen = Instant::now();
+    }
 }
 
 #[derive(Clone)]
@@ -95,7 +106,6 @@ impl Client {
         }
     }
 }
-
 struct ProxyManager {
     // Mode how master node works
     client_assign_mode: u8, // 1 or 2
@@ -186,6 +196,20 @@ impl ProxyManager {
         }
     }
 
+    async fn monitor_slave_health(self: Arc<Self>, slave: Slave) {
+        let timeout_duration = Duration::from_secs(20);
+        loop {
+            tokio::time::sleep(Duration::from_secs(KEEP_ALIVE_DURATION)).await;
+
+            let last_seen = *slave.last_seen.lock().await;
+            if last_seen.elapsed() > timeout_duration {
+                warn!("Slave {} timed out.", slave.ip_addr);
+                self.handle_slave_disconnection(&slave.ip_addr).await;
+                break;
+            }
+        }
+    }
+
     async fn handle_slave_disconnection(&self, slave_ip: &str) {
         info!("Slave {} disconnected", slave_ip);
 
@@ -194,9 +218,6 @@ impl ProxyManager {
 
             if slaves.remove(slave_ip).is_some() {
                 debug!("Removed disconnected slave: {}", slave_ip);
-            } else {
-                warn!("Attempted to remove non-existent slave: {}", slave_ip);
-                return;
             }
         }
     }
@@ -241,6 +262,10 @@ fn build_version_check_command() -> Vec<u8> {
     build_command_frame(PacketType::Command, 0, Some(CommandType::VersionCheck), &[])
 }
 
+fn build_heartbeat_command() -> Vec<u8> {
+    build_command_frame(PacketType::Command, 0, Some(CommandType::Heartbeat), &[])
+}
+
 fn build_data_frame(session_id: u32, payload: &[u8]) -> Vec<u8> {
     build_command_frame(PacketType::Data, session_id, None, payload)
 }
@@ -281,6 +306,7 @@ async fn handle_slave_io(
     // Prepare the commands
     let speed_check_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
     let version_check_command = build_version_check_command();
+    let heartbeat_command = build_heartbeat_command();
 
     // Send commands concurrently by spawning async tasks
     {
@@ -297,6 +323,9 @@ async fn handle_slave_io(
         // Await both tasks to ensure commands are sent before proceeding
         let _ = tokio::try_join!(send_speed_check, send_version_check)?;
     }
+
+    // Heartbeat setup
+    let mut heartbeat_interval = time::interval(Duration::from_secs(KEEP_ALIVE_DURATION));
 
     loop {
         tokio::select! {
@@ -329,34 +358,14 @@ async fn handle_slave_io(
 
                     debug!("Processing packet from slave: {} | PacketType: {:?} | CommandType: {:?}", 
                           slave.ip_addr, current_packet_type, current_command_type);
-
-                    match current_packet_type {
-                        Some(PacketType::Command) => {
-                            match current_command_type {
-                                Some(CommandType::SpeedCheck) => {
-                                    let speed_str = String::from_utf8(payload.clone()).unwrap_or_default();
-                                    if let Ok(speed) = speed_str.parse::<f64>() {
-                                        proxy_manager.update_slave_speed(&slave.ip_addr, speed).await;
-                                        info!("Slave: {} | Net speed: {:.2} Mbps", slave.ip_addr, speed);
-                                    } else {
-                                        warn!("Failed to parse SpeedCheck response from slave: {}", slave.ip_addr);
-                                    }
-                                }
-                                Some(CommandType::VersionCheck) => {
-                                    let version = String::from_utf8(payload.clone()).unwrap_or_default();
-                                    proxy_manager.update_slave_version(&slave.ip_addr, version.clone()).await;
-                                    info!("Slave: {} | Version: {}", slave.ip_addr, version);
-                                }
-                                None => error!("Unknown CommandType received from slave: {}", slave.ip_addr),
-                            }
-                        }
-                        Some(PacketType::Data) => {
-                            proxy_manager.route_to_client(session_id, payload).await;
-                        }
-                        None => {
-                            error!("Unknown PacketType received from slave: {}", slave.ip_addr);
-                        }
-                    }
+                    process_packet(
+                        current_packet_type,
+                        current_command_type,
+                        &payload,
+                        session_id,
+                        &slave,
+                        &proxy_manager
+                    ).await?;
                 }
             }
 
@@ -366,11 +375,67 @@ async fn handle_slave_io(
                 let frame = build_data_frame(client_session_id, &client_data);
                 slave.write_stream(&frame).await?;
             }
+
+            // Heartbeat timer to send periodic heartbeats to the slave
+            _ = heartbeat_interval.tick() => {
+                let mut slave_stream = slave.stream.lock().await;
+                slave_stream.write_all(&heartbeat_command).await?;
+                slave_stream.flush().await?;
+            }
         }
     }
 
     proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
     
+    Ok(())
+}
+
+async fn process_packet(
+    packet_type: Option<PacketType>,
+    command_type: Option<CommandType>,
+    payload: &[u8],
+    session_id: u32,
+    slave: &Slave,
+    proxy_manager: &Arc<ProxyManager>,
+) -> Result<(), std::io::Error> {
+    match packet_type {
+        Some(PacketType::Command) => {
+            match command_type {
+                Some(CommandType::SpeedCheck) => {
+                    let speed_str = String::from_utf8(payload.to_vec()).unwrap_or_default();
+                    if let Ok(speed) = speed_str.parse::<f64>() {
+                        proxy_manager.update_slave_speed(&slave.ip_addr, speed).await;
+                        info!("Slave: {} | Net speed: {:.2} Mbps", slave.ip_addr, speed);
+                    } else {
+                        warn!("Failed to parse SpeedCheck response from slave: {}", slave.ip_addr);
+                    }
+                }
+                Some(CommandType::VersionCheck) => {
+                    let version = String::from_utf8(payload.to_vec()).unwrap_or_default();
+                    proxy_manager.update_slave_version(&slave.ip_addr, version.clone()).await;
+                    info!("Slave: {} | Version: {}", slave.ip_addr, version);
+                }
+                Some(CommandType::Heartbeat) => {
+                    // Update last_seen on valid heartbeat response
+                    if payload == b"ALIVE" {
+                        slave.update_last_seen().await;
+                        trace!("Received heartbeat response from slave {}", slave.ip_addr);
+                    } else {
+                        warn!("Invalid heartbeat response from slave {}: {:?}", slave.ip_addr, payload);
+                        proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
+                    }
+                }
+                None => error!("Unknown CommandType received from slave: {}", slave.ip_addr),
+            }
+        }
+        Some(PacketType::Data) => {
+            proxy_manager.route_to_client(session_id, payload.to_vec()).await;
+        }
+        None => {
+            error!("Unknown PacketType received from slave: {}", slave.ip_addr);
+        }
+    }
+
     Ok(())
 }
 
@@ -451,6 +516,10 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
                 error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
             }
         });
+
+        // Spawn a task to monitor the slave's health
+        let proxy_manager_clone = Arc::clone(&proxy_manager);
+        tokio::spawn(proxy_manager_clone.monitor_slave_health(new_slave.clone()));
     }
 }
 

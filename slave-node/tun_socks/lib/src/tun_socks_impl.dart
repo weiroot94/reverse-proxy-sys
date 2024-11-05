@@ -16,6 +16,7 @@ const int commandPacket = 0x01;
 // Command ID constants
 const int speedCheck = 0x01;
 const int versionCheck = 0x02;
+const int heartbeatCheck = 0x03;
 
 class ProtocolPacket {
   final int sessionId;
@@ -68,10 +69,9 @@ class TunSocks {
   
   String get slaveVersion => packageVersion;
 
-  // Check Ip address change
-  List<String> _lastKnownIps = [];
-  Timer? _ipCheckTimer;
-  final Duration ipCheckInterval = Duration(seconds: 10);
+  // Heartbeat Monitoring
+  Timer? _heartbeatTimer;
+  final Duration heartbeatInterval = Duration(seconds: 15);
 
   TunSocks({
     required this.host,
@@ -91,10 +91,6 @@ class TunSocks {
 
       print('Connected to master node at $host:$port');
       currentState = ProxyState.connected;
-
-      // Fetch initial IPs and start IP monitoring
-      _lastKnownIps = await _getLocalIpAddresses();
-      _startIpMonitoring();
 
       _masterConn!
           .transform(StreamTransformer.fromBind((stream) => MasterTrafficParser().bind(stream)))
@@ -118,45 +114,12 @@ class TunSocks {
             print('Master connection error: $error');
             _handleDisconnection();
           });
+      
+      _manageHeartbeatTimer();
     } catch (e) {
       print('Failed to connect to master: $e');
       _handleDisconnection();
     }
-  }
-
-  void _startIpMonitoring() {
-    _ipCheckTimer = Timer.periodic(ipCheckInterval, (timer) async {
-      final currentIps = await _getLocalIpAddresses();
-      if (!_listEquals(_lastKnownIps, currentIps)) {
-        print('IP address change detected: $_lastKnownIps -> $currentIps');
-        _lastKnownIps = currentIps;
-        _handleDisconnection();
-      }
-    });
-  }
-
-  Future<List<String>> _getLocalIpAddresses() async {
-    List<String> ips = [];
-    try {
-      final interfaces = await NetworkInterface.list(
-          type: InternetAddressType.IPv4, includeLinkLocal: false);
-      for (var interface in interfaces) {
-        for (var addr in interface.addresses) {
-          ips.add(addr.address);
-        }
-      }
-    } catch (e) {
-      print('Error obtaining IP addresses: $e');
-    }
-    return ips;
-  }
-
-  bool _listEquals(List<String> a, List<String> b) {
-    if (a.length != b.length) return false;
-    for (int i = 0; i < a.length; i++) {
-      if (a[i] != b[i]) return false;
-    }
-    return true;
   }
 
   Future<void> _handleCommand(int? commandId, List<int> payload) async {
@@ -166,6 +129,10 @@ class TunSocks {
         break;
       case versionCheck:
         _sendVersionInfo();
+        break;
+      case heartbeatCheck:
+        _sendAliveResponse();
+        _manageHeartbeatTimer();
         break;
       default:
         print('Unknown command received');
@@ -190,6 +157,17 @@ class TunSocks {
 
     print('Retrying connection... Attempt $retryAttempts');
     startTunnel();
+  }
+
+  void _manageHeartbeatTimer() {
+    // Cancel any existing heartbeat timer
+    _heartbeatTimer?.cancel();
+
+    // Start a new timer to wait for the next heartbeat
+    _heartbeatTimer = Timer(heartbeatInterval, () {
+      print("No heartbeat from master, reconnecting...");
+      _handleDisconnection();
+    });
   }
 
   Future<void> _performSpeedTest(List<int> payload) async {
@@ -260,6 +238,10 @@ class TunSocks {
     _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: versionCheck);
   }
 
+  void _sendAliveResponse() {
+    _sendToMasterInProtocol(0, utf8.encode("ALIVE"), packetType: commandPacket, commandId: heartbeatCheck);
+  }
+
   // Data packet example:
   void _sendDataPacket(int sessionId, List<int> data) {
     _sendToMasterInProtocol(sessionId, data);
@@ -267,7 +249,6 @@ class TunSocks {
 
   void stopTunnel() {
     isManuallyStopped = true;
-    _ipCheckTimer?.cancel();
     _cleanupConnections();
     print('Proxy server stopped.');
   }
