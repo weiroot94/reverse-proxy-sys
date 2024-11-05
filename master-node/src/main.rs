@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use log::{trace, debug, info, warn, error, LevelFilter};
 use simple_logger::SimpleLogger;
 use getopts::Options;
@@ -56,6 +57,7 @@ struct Slave {
     tx: mpsc::Sender<(u32, Vec<u8>)>,
     // Track the last successful heartbeat time
     last_seen: Arc<AsyncMutex<Instant>>,
+    is_disconnected: Arc<AtomicBool>,
 }
 
 impl Slave {
@@ -68,6 +70,7 @@ impl Slave {
             stream: Arc::new(AsyncMutex::new(stream)),
             tx,
             last_seen: Arc::new(AsyncMutex::new(Instant::now())),
+            is_disconnected: Arc::new(AtomicBool::new(false)),
         };
         (slave, rx)
     }
@@ -204,6 +207,7 @@ impl ProxyManager {
             let last_seen = *slave.last_seen.lock().await;
             if last_seen.elapsed() > timeout_duration {
                 warn!("Slave {} timed out.", slave.ip_addr);
+                slave.is_disconnected.store(true, Ordering::Relaxed);
                 self.handle_slave_disconnection(&slave.ip_addr).await;
                 break;
             }
@@ -212,7 +216,6 @@ impl ProxyManager {
 
     async fn handle_slave_disconnection(&self, slave_ip: &str) {
         info!("Slave {} disconnected", slave_ip);
-
         {
             let mut slaves = self.slaves.lock().await;
 
@@ -328,6 +331,11 @@ async fn handle_slave_io(
     let mut heartbeat_interval = time::interval(Duration::from_secs(KEEP_ALIVE_DURATION));
 
     loop {
+        if slave.is_disconnected.load(Ordering::Relaxed) {
+            info!("Slave {} already marked as disconnected. Exiting IO handler.", slave.ip_addr);
+            return Ok(());
+        }
+
         tokio::select! {
             // Handle incoming traffic from the slave
             len = slave.read_stream(&mut buffer) => {
@@ -384,8 +392,6 @@ async fn handle_slave_io(
             }
         }
     }
-
-    proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
     
     Ok(())
 }
