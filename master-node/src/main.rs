@@ -5,12 +5,15 @@ use log::{trace, debug, info, warn, error, LevelFilter};
 use simple_logger::SimpleLogger;
 use getopts::Options;
 use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, net::{TcpListener, TcpStream}};
-use tokio::time::{self, Duration, Instant};
+use tokio::time::{self, Duration, Instant, timeout};
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, Semaphore};
 
 const KEEP_ALIVE_DURATION: u64 = 10;
 const MAX_BUF_SIZE: usize = 8192;
+
+const MAX_CONCURRENT_REQUESTS: usize = 100;
+const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PacketType {
@@ -436,6 +439,7 @@ async fn handle_client_io(
     slave_tx: mpsc::Sender<(u32, Vec<u8>)>,
     mut client_rx: mpsc::Receiver<Vec<u8>>,
     proxy_manager: Arc<ProxyManager>,
+    semaphore: Arc<Semaphore>,
 ) -> Result<(), std::io::Error> {
     // Add client session
     proxy_manager.clients.insert(session_id, client.clone());
@@ -445,17 +449,30 @@ async fn handle_client_io(
 
     // Main loop to handle continuous traffic between client and slave
     loop {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+
         tokio::select! {
-            client_read = cli_stream.read(&mut client_buffer) => {
-                let len = client_read?;
-                if len > 0 {
-                    trace!("Client -> Master: sid {}, size: {} bytes", session_id, len);
-                    let _ = slave_tx.send((session_id, client_buffer[..len].to_vec())).await;
-                } else {
-                    break; // Client connection closed
+            client_read = timeout(CLIENT_REQUEST_TIMEOUT, cli_stream.read(&mut client_buffer)) => {
+                match client_read {
+                    Ok(Ok(len)) => {
+                        if len == 0 {
+                            break;
+                        }
+                        trace!("Client -> Master: sid {}, size: {} bytes", session_id, len);
+                        let _ = slave_tx.send((session_id, client_buffer[..len].to_vec())).await;
+                    }
+                    Ok(Err(e)) => {
+                        error!("Error reading from client {}: {}", session_id, e);
+                        break;
+                    }
+                    Err(_) => {
+                        trace!("Timeout reading from client {}", session_id);
+                        break;
+                    }
                 }
             }
 
+            // Handle traffic from the slave to the client
             Some(payload) = client_rx.recv() => {
                 trace!("Master -> Client: sid {}, size: {} bytes", session_id, payload.len());
                 if let Err(e) = cli_stream.write_all(&payload).await {
@@ -466,6 +483,8 @@ async fn handle_client_io(
                 }
             }
         }
+
+        drop(permit);
     }
 
     // Cleanup after the session ends
@@ -613,6 +632,9 @@ async fn main() -> io::Result<()>  {
         cli_ip_to_slave: Arc::new(DashMap::new()),
     });
 
+    // Initialize the semaphore for rate limiting
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
     if matches.opt_count("t") > 0 {
         let master_addr: String = matches.opt_str("t").unwrap_or_else(|| {
             error!("Not found listen port. eg: net-relay -t 0.0.0.0:8000 -s 0.0.0.0:1080");
@@ -675,7 +697,8 @@ async fn main() -> io::Result<()>  {
     
                 // Spawn a task to handle traffic between the client and the assigned slave
                 let proxy_manager_clone = Arc::clone(&proxy_manager);
-                tokio::spawn(handle_client_io(session_id, client, slave_tx, client_rx, proxy_manager_clone));
+                let semaphore_clone = Arc::clone(&semaphore);
+                tokio::spawn(handle_client_io(session_id, client, slave_tx, client_rx, proxy_manager_clone, semaphore_clone));
             }
         }
     } else {
