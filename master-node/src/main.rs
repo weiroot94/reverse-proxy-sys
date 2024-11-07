@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use log::{trace, debug, info, warn, error, LevelFilter};
@@ -115,34 +115,31 @@ struct ProxyManager {
     slave_recovery_mode: u8, // 1 or 2
 
     // Slaves and clients
-    slaves: Arc<AsyncMutex<HashMap<String, Slave>>>,
-    clients: Arc<AsyncMutex<HashMap<u32, Client>>>,
+    slaves: Arc<DashMap<String, Slave>>,
+    clients: Arc<DashMap<u32, Client>>,
 
     // Map client IP addresses to slave IPs in Client Assignment Mode 1
-    cli_ip_to_slave: Arc<AsyncMutex<HashMap<String, String>>>,
+    cli_ip_to_slave: Arc<DashMap<String, String>>,
 }
 
 impl ProxyManager {
     // Get tx of avaiable Slave using weighted round-robin
     async fn get_available_slave_tx(&self, client_ip: &String) -> Option<mpsc::Sender<(u32, Vec<u8>)>> {
-        let mut cli_ip_to_slave = self.cli_ip_to_slave.lock().await;
-        let slaves = self.slaves.lock().await;
-
         // Mode 1: Assign the same slave to clients from the same IP
         if self.client_assign_mode == 1 {
-            // Mode 1: Assign the same slave to clients from the same IP
-            if let Some(slave_ip) = cli_ip_to_slave.get(client_ip) {
-                return slaves.get(slave_ip).map(|slave| slave.tx.clone());
+            if let Some(slave_ip) = self.cli_ip_to_slave.get(client_ip).map(|v| v.clone()) {
+                return self.slaves.get(&slave_ip).map(|slave| slave.tx.clone());
             }
         }
 
         let mut total_weight = 0.0;
-        let available_slaves: Vec<_> = slaves.values()
-            .filter_map(|slave| {
+        let available_slaves: Vec<_> = self.slaves.iter()
+            .filter_map(|entry| {
+                let slave = entry.value();
                 let weight = slave.net_speed;
                 if weight > 0.0 {
                     total_weight += weight;
-                    Some((slave, weight))
+                    Some((slave.clone(), weight))
                 } else {
                     None
                 }
@@ -154,18 +151,16 @@ impl ProxyManager {
         }
 
         // Weighted round-robin selection
-        if total_weight > 0.0 {
-            let mut random_weight: f64 = rand::random::<f64>() * total_weight;
-            for (slave, weight) in available_slaves {
-                if random_weight < weight {
-                    // In sticky mode, save the selected slave's IP for future requests from this client
-                    if self.client_assign_mode == 1 {
-                        cli_ip_to_slave.insert(client_ip.clone(), slave.ip_addr.clone());
-                    }
-                    return Some(slave.tx.clone()); // Return only the tx channel of the selected slave
+        let mut random_weight: f64 = rand::random::<f64>() * total_weight;
+        for (slave, weight) in available_slaves {
+            if random_weight < weight {
+                // Save the selected slave's IP for future requests from this client in sticky mode
+                if self.client_assign_mode == 1 {
+                    self.cli_ip_to_slave.insert(client_ip.clone(), slave.ip_addr.clone());
                 }
-                random_weight -= weight;
+                return Some(slave.tx.clone());
             }
+            random_weight -= weight;
         }
 
         None
@@ -173,12 +168,7 @@ impl ProxyManager {
 
     // Route data to the appropriate client using the session ID
     async fn route_to_client(&self, session_id: u32, payload: Vec<u8>) {
-        let client = {
-            let clients = self.clients.lock().await;
-            clients.get(&session_id).cloned()
-        };
-
-        if let Some(client) = client {
+        if let Some(client) = self.clients.get(&session_id) {
             if let Err(e) = client.to_client_tx.send(payload).await {
                 error!("Failed to send data to client {}: {}", session_id, e);
             }
@@ -186,15 +176,13 @@ impl ProxyManager {
     }
 
     async fn update_slave_speed(&self, slave_ip: &str, net_speed: f64) {
-        let mut slaves = self.slaves.lock().await;
-        if let Some(slave) = slaves.get_mut(slave_ip) {
+        if let Some(mut slave) = self.slaves.get_mut(slave_ip) {
             slave.net_speed = net_speed;
         }
     }
 
     async fn update_slave_version(&self, slave_ip: &str, version: String) {
-        let mut slaves = self.slaves.lock().await;
-        if let Some(slave) = slaves.get_mut(slave_ip) {
+        if let Some(mut slave) = self.slaves.get_mut(slave_ip) {
             slave.version = Some(version.clone());
         }
     }
@@ -216,12 +204,8 @@ impl ProxyManager {
 
     async fn handle_slave_disconnection(&self, slave_ip: &str) {
         info!("Slave {} disconnected", slave_ip);
-        {
-            let mut slaves = self.slaves.lock().await;
-
-            if slaves.remove(slave_ip).is_some() {
-                debug!("Removed disconnected slave: {}", slave_ip);
-            }
+        if self.slaves.remove(slave_ip).is_some() {
+            debug!("Removed disconnected slave: {}", slave_ip);
         }
     }
 }
@@ -454,7 +438,7 @@ async fn handle_client_io(
     proxy_manager: Arc<ProxyManager>,
 ) -> Result<(), std::io::Error> {
     // Add client session
-    proxy_manager.clients.lock().await.insert(session_id, client.clone());
+    proxy_manager.clients.insert(session_id, client.clone());
 
     let mut client_buffer = [0u8; MAX_BUF_SIZE];
     let mut cli_stream = client.stream.lock().await;
@@ -485,7 +469,7 @@ async fn handle_client_io(
     }
 
     // Cleanup after the session ends
-    proxy_manager.clients.lock().await.remove(&session_id);
+    proxy_manager.clients.remove(&session_id);
 
     // Close the client stream
     debug!("Closing client stream for session ID {}.", session_id);
@@ -508,9 +492,7 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
 
         // Create a new Slave object
         let (new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
-
-        // Update ProxyManager with the new slave
-        proxy_manager.slaves.lock().await.insert(new_slave.ip_addr.clone(), new_slave.clone());
+        proxy_manager.slaves.insert(new_slave.ip_addr.clone(), new_slave.clone());
 
         // Spawn a task to handle the slave's I/O operations
         let proxy_manager_clone = Arc::clone(&proxy_manager);
@@ -626,9 +608,9 @@ async fn main() -> io::Result<()>  {
     let proxy_manager = Arc::new(ProxyManager {
         client_assign_mode,
         slave_recovery_mode,
-        slaves: Arc::new(AsyncMutex::new(HashMap::new())),
-        clients: Arc::new(AsyncMutex::new(HashMap::new())),
-        cli_ip_to_slave: Arc::new(AsyncMutex::new(HashMap::new())),
+        slaves: Arc::new(DashMap::new()),
+        clients: Arc::new(DashMap::new()),
+        cli_ip_to_slave: Arc::new(DashMap::new()),
     });
 
     if matches.opt_count("t") > 0 {
