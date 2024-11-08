@@ -67,8 +67,6 @@ class TunSocks {
   List<int> accumulatedBuffer = [];
   bool isManuallyStopped = false;
   
-  String get slaveVersion => packageVersion;
-
   // Heartbeat Monitoring
   Timer? _heartbeatTimer;
   final Duration heartbeatInterval = Duration(seconds: 15);

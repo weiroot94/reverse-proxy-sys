@@ -11,7 +11,7 @@ dependencies:
   flutter:
     sdk: flutter
 
-  http: ^0.13.5
+  http: ^1.2.2
   synchronized: ^3.0.0
 
 dev_dependencies:

@@ -1,6 +1,2 @@
-// lib/src/version.dart
 
-library version;
-
-// Reference the generated file
-part 'version.g.dart';
+const slaveVersion = '1.0.3';
