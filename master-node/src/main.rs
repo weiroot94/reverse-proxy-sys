@@ -8,12 +8,87 @@ use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, net::{TcpListener, TcpStrea
 use tokio::time::{self, Duration, Instant, timeout};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, Semaphore};
+use bytes::{BytesMut, Bytes, Buf, BufMut};
+use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 const KEEP_ALIVE_DURATION: u64 = 10;
 const MAX_BUF_SIZE: usize = 8192;
 
 const MAX_CONCURRENT_REQUESTS: usize = 100;
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+const POOL_SIZE: usize = 50;
+const NUM_SHARDS: usize = 8;
+
+// Sharded Buffer Pool for high concurrency
+#[derive(Clone)]
+struct ShardedBufferPool {
+    shards: Vec<Arc<BufferPoolShard>>,
+}
+
+impl ShardedBufferPool {
+    fn new(num_shards: usize, pool_size: usize) -> Self {
+        let shards = (0..num_shards)
+            .map(|_| Arc::new(BufferPoolShard::new(pool_size)))
+            .collect();
+        Self { shards }
+    }
+
+    async fn get_buffer(&self, id: usize) -> BytesMut {
+        let shard = &self.shards[id % self.shards.len()];
+        shard.get_buffer().await
+    }
+
+    async fn return_buffer(&self, id: usize, buffer: BytesMut) {
+        let shard = &self.shards[id % self.shards.len()];
+        shard.return_buffer(buffer).await;
+    }
+}
+
+struct BufferPoolShard {
+    buffers: AsyncMutex<VecDeque<BytesMut>>,
+}
+
+impl BufferPoolShard {
+    fn new(pool_size: usize) -> Self {
+        let mut buffers = VecDeque::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            buffers.push_back(BytesMut::with_capacity(MAX_BUF_SIZE));
+        }
+        Self {
+            buffers: AsyncMutex::new(buffers),
+        }
+    }
+
+    async fn get_buffer(&self) -> BytesMut {
+        let mut buffers = self.buffers.lock().await;
+        if let Some(mut buffer) = buffers.pop_front() {
+            if buffer.capacity() < MAX_BUF_SIZE {
+                debug!("Discarding undersized buffer, creating new one");
+                buffer = BytesMut::with_capacity(MAX_BUF_SIZE);
+            } else {
+                buffer.clear(); // Prepare buffer for reuse
+            }
+            debug!("Borrowed buffer: capacity = {}", buffer.capacity());
+            buffer
+        } else {
+            debug!("No available buffer, creating new one");
+            BytesMut::with_capacity(MAX_BUF_SIZE)
+        }
+    }
+
+    async fn return_buffer(&self, buffer: BytesMut) {
+        let mut buffers = self.buffers.lock().await;
+        if buffers.len() < POOL_SIZE {
+            debug!("Returning buffer to pool: capacity = {}", buffer.capacity());
+            buffers.push_back(buffer);
+        } else {
+            debug!("Buffer pool full, discarding buffer");
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PacketType {
@@ -57,14 +132,14 @@ struct Slave {
     net_speed: f64,
     stream: Arc<AsyncMutex<TcpStream>>,
     // Sender to receive data from clients
-    tx: mpsc::Sender<(u32, Vec<u8>)>,
+    tx: mpsc::Sender<(u32, Bytes)>,
     // Track the last successful heartbeat time
     last_seen: Arc<AsyncMutex<Instant>>,
     is_disconnected: Arc<AtomicBool>,
 }
 
 impl Slave {
-    fn new(ip_addr: String, stream: TcpStream) -> (Self, mpsc::Receiver<(u32, Vec<u8>)>) {
+    fn new(ip_addr: String, stream: TcpStream) -> (Self, mpsc::Receiver<(u32, Bytes)>) {
         let (tx, rx) = mpsc::channel(100);
         let slave = Self {
             ip_addr,
@@ -79,13 +154,13 @@ impl Slave {
     }
 
     // Helper method to read from the slave stream
-    async fn read_stream(&self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+    async fn read_stream(&self, buffer: &mut BytesMut) -> Result<usize, std::io::Error> {
         let mut slave_stream = self.stream.lock().await;
-        slave_stream.read(buffer).await
+        slave_stream.read_buf(buffer).await
     }
 
     // Helper method to write to the slave stream
-    async fn write_stream(&self, frame: &[u8]) -> Result<(), std::io::Error> {
+    async fn write_stream(&self, frame: &Bytes) -> Result<(), std::io::Error> {
         let mut stream = self.stream.lock().await;
         stream.write_all(frame).await?;
         stream.flush().await?;
@@ -101,11 +176,11 @@ impl Slave {
 #[derive(Clone)]
 struct Client {
     stream: Arc<AsyncMutex<TcpStream>>,
-    to_client_tx: mpsc::Sender<Vec<u8>>,
+    to_client_tx: mpsc::Sender<Bytes>,
 }
 
 impl Client {
-    fn new(stream: Arc<AsyncMutex<TcpStream>>, to_client_tx: mpsc::Sender<Vec<u8>>) -> Self {
+    fn new(stream: Arc<AsyncMutex<TcpStream>>, to_client_tx: mpsc::Sender<Bytes>) -> Self {
         Self {
             stream,
             to_client_tx,
@@ -127,7 +202,7 @@ struct ProxyManager {
 
 impl ProxyManager {
     // Get tx of avaiable Slave using weighted round-robin
-    async fn get_available_slave_tx(&self, client_ip: &String) -> Option<mpsc::Sender<(u32, Vec<u8>)>> {
+    async fn get_available_slave_tx(&self, client_ip: &String) -> Option<mpsc::Sender<(u32, Bytes)>> {
         // Mode 1: Assign the same slave to clients from the same IP
         if self.client_assign_mode == 1 {
             if let Some(slave_ip) = self.cli_ip_to_slave.get(client_ip).map(|v| v.clone()) {
@@ -170,7 +245,7 @@ impl ProxyManager {
     }
 
     // Route data to the appropriate client using the session ID
-    async fn route_to_client(&self, session_id: u32, payload: Vec<u8>) {
+    async fn route_to_client(&self, session_id: u32, payload: Bytes) {
         if let Some(client) = self.clients.get(&session_id) {
             if let Err(e) = client.to_client_tx.send(payload).await {
                 error!("Failed to send data to client {}: {}", session_id, e);
@@ -228,35 +303,35 @@ fn bytes_to_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(array)
 }
 
-fn build_command_frame(packet_type: PacketType, session_id: u32, command_type: Option<CommandType>, payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(10 + payload.len());
-    frame.push(packet_type as u8);
-    frame.extend_from_slice(&session_id.to_be_bytes());
+fn build_command_frame(packet_type: PacketType, session_id: u32, command_type: Option<CommandType>, payload: &[u8]) -> Bytes {
+    let mut frame = BytesMut::with_capacity(10 + payload.len());
+    frame.put_u8(packet_type as u8);
+    frame.put_u32(session_id);
     
     if let Some(cmd) = command_type {
-        frame.push(cmd as u8);
+        frame.put_u8(cmd as u8);
     } else {
-        frame.push(0x00);
+        frame.put_u8(0x00);
     }
 
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(payload);
-    frame
+    frame.put_u32(payload.len() as u32);
+    frame.put_slice(payload);
+    frame.freeze()
 }
 
-fn build_speed_test_command(url: &str) -> Vec<u8> {
+fn build_speed_test_command(url: &str) -> Bytes {
     build_command_frame(PacketType::Command, 0, Some(CommandType::SpeedCheck), url.as_bytes())
 }
 
-fn build_version_check_command() -> Vec<u8> {
+fn build_version_check_command() -> Bytes {
     build_command_frame(PacketType::Command, 0, Some(CommandType::VersionCheck), &[])
 }
 
-fn build_heartbeat_command() -> Vec<u8> {
+fn build_heartbeat_command() -> Bytes {
     build_command_frame(PacketType::Command, 0, Some(CommandType::Heartbeat), &[])
 }
 
-fn build_data_frame(session_id: u32, payload: &[u8]) -> Vec<u8> {
+fn build_data_frame(session_id: u32, payload: &[u8]) -> Bytes {
     build_command_frame(PacketType::Data, session_id, None, payload)
 }
 
@@ -284,14 +359,21 @@ fn parse_header(buffer: &[u8]) -> (Option<PacketType>, u32, usize, Option<Comman
     (packet_type, session_id, payload_len, command_type)
 }
 
+fn hash_ip(ip_addr: &str) -> usize {
+    let mut hasher = DefaultHasher::new();
+    ip_addr.hash(&mut hasher);
+    hasher.finish() as usize
+}
+
 // Function to handle a single slave's I/O operations for all clients using it (multiplexing)
 async fn handle_slave_io(
     slave: Slave,
-    mut cli_rx: mpsc::Receiver<(u32, Vec<u8>)>,
+    mut cli_rx: mpsc::Receiver<(u32, Bytes)>,
     proxy_manager: Arc<ProxyManager>,
+    buffer_pool: Arc<ShardedBufferPool>,
 ) -> Result<(), std::io::Error> {
-    let mut buffer = [0u8; MAX_BUF_SIZE];
-    let mut accumulated_buffer: Vec<u8> = Vec::new();
+    let shard_id = hash_ip(&slave.ip_addr);
+    let mut buffer = buffer_pool.get_buffer(shard_id).await;
 
     // Prepare the commands
     let speed_check_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
@@ -331,32 +413,24 @@ async fn handle_slave_io(
                     break;  // Slave connection closed
                 }
 
-                accumulated_buffer.extend_from_slice(&buffer[..len]);
+                while buffer.len() >= 10 {
+                    let (current_packet_type, session_id, payload_len, current_command_type) = parse_header(&buffer);
 
-                while accumulated_buffer.len() >= 10 {
-                    let (current_packet_type, session_id, payload_len, current_command_type) = parse_header(&accumulated_buffer);
-
-                    if current_packet_type.is_none() {
+                    if current_packet_type.is_none() || buffer.len() < 10 + payload_len {
                         break;
                     }
 
-                    // Ensure we have the entire payload before processing
-                    if accumulated_buffer.len() < 10 + payload_len {
-                        break;
-                    }
-
-                    // Remove the header from the buffer
-                    accumulated_buffer.drain(0..10);
+                    buffer.advance(10);
 
                     // Process the packet with the current_packet_type and current_command_type
-                    let payload = accumulated_buffer.drain(0..payload_len).collect::<Vec<u8>>();
+                    let payload = buffer.split_to(payload_len).freeze();
 
                     debug!("Processing packet from slave: {} | PacketType: {:?} | CommandType: {:?}", 
                           slave.ip_addr, current_packet_type, current_command_type);
                     process_packet(
                         current_packet_type,
                         current_command_type,
-                        &payload,
+                        payload,
                         session_id,
                         &slave,
                         &proxy_manager
@@ -373,20 +447,19 @@ async fn handle_slave_io(
 
             // Heartbeat timer to send periodic heartbeats to the slave
             _ = heartbeat_interval.tick() => {
-                let mut slave_stream = slave.stream.lock().await;
-                slave_stream.write_all(&heartbeat_command).await?;
-                slave_stream.flush().await?;
+                slave.write_stream(&heartbeat_command).await?;
             }
         }
     }
     
+    buffer_pool.return_buffer(shard_id, buffer).await;
     Ok(())
 }
 
 async fn process_packet(
     packet_type: Option<PacketType>,
     command_type: Option<CommandType>,
-    payload: &[u8],
+    payload: Bytes,
     session_id: u32,
     slave: &Slave,
     proxy_manager: &Arc<ProxyManager>,
@@ -410,7 +483,7 @@ async fn process_packet(
                 }
                 Some(CommandType::Heartbeat) => {
                     // Update last_seen on valid heartbeat response
-                    if payload == b"ALIVE" {
+                    if payload.as_ref() == b"ALIVE" {
                         slave.update_last_seen().await;
                         trace!("Received heartbeat response from slave {}", slave.ip_addr);
                     } else {
@@ -422,7 +495,7 @@ async fn process_packet(
             }
         }
         Some(PacketType::Data) => {
-            proxy_manager.route_to_client(session_id, payload.to_vec()).await;
+            proxy_manager.route_to_client(session_id, payload).await;
         }
         None => {
             error!("Unknown PacketType received from slave: {}", slave.ip_addr);
@@ -436,30 +509,39 @@ async fn process_packet(
 async fn handle_client_io(
     session_id: u32,
     client: Client,
-    slave_tx: mpsc::Sender<(u32, Vec<u8>)>,
-    mut client_rx: mpsc::Receiver<Vec<u8>>,
+    slave_tx: mpsc::Sender<(u32, Bytes)>,
+    mut client_rx: mpsc::Receiver<Bytes>,
     proxy_manager: Arc<ProxyManager>,
     semaphore: Arc<Semaphore>,
+    buffer_pool: Arc<ShardedBufferPool>,
 ) -> Result<(), std::io::Error> {
     // Add client session
     proxy_manager.clients.insert(session_id, client.clone());
 
-    let mut client_buffer = [0u8; MAX_BUF_SIZE];
     let mut cli_stream = client.stream.lock().await;
+    let shard_id = session_id as usize;
 
     // Main loop to handle continuous traffic between client and slave
     loop {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let mut buffer = buffer_pool.get_buffer(shard_id).await;
 
         tokio::select! {
-            client_read = timeout(CLIENT_REQUEST_TIMEOUT, cli_stream.read(&mut client_buffer)) => {
+            client_read = timeout(CLIENT_REQUEST_TIMEOUT, cli_stream.read_buf(&mut buffer)) => {
                 match client_read {
                     Ok(Ok(len)) => {
                         if len == 0 {
+                            debug!("Client {} closed connection", session_id);
                             break;
                         }
+
                         trace!("Client -> Master: sid {}, size: {} bytes", session_id, len);
-                        let _ = slave_tx.send((session_id, client_buffer[..len].to_vec())).await;
+
+                        let data = buffer.split().freeze();
+                        if slave_tx.send((session_id, data)).await.is_err() {
+                            warn!("Failed to send data to slave for session {}", session_id);
+                            break;
+                        }
                     }
                     Ok(Err(e)) => {
                         error!("Error reading from client {}: {}", session_id, e);
@@ -477,13 +559,16 @@ async fn handle_client_io(
                 trace!("Master -> Client: sid {}, size: {} bytes", session_id, payload.len());
                 if let Err(e) = cli_stream.write_all(&payload).await {
                     error!("Failed to send data to client {}: {}", session_id, e);
+                    break;
                 }
                 if let Err(e) = cli_stream.flush().await {
                     error!("Failed to flush stream for client {}: {}", session_id, e);
+                    break;
                 }
             }
         }
 
+        buffer_pool.return_buffer(shard_id, buffer).await;
         drop(permit);
     }
 
@@ -497,7 +582,11 @@ async fn handle_client_io(
     Ok(())
 }
 
-async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Arc<ProxyManager>) -> Result<(), Box<dyn Error>> {
+async fn handle_slave_connections(
+    slave_listener: TcpListener,
+    proxy_manager: Arc<ProxyManager>,
+    buffer_pool: Arc<ShardedBufferPool>
+) -> Result<(), Box<dyn Error>> {
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
             Err(e) => {
@@ -516,9 +605,10 @@ async fn handle_slave_connections(slave_listener: TcpListener, proxy_manager: Ar
         // Spawn a task to handle the slave's I/O operations
         let proxy_manager_clone = Arc::clone(&proxy_manager);
         let new_slave_clone = new_slave.clone();
+        let buffer_pool_clone = Arc::clone(&buffer_pool);
         tokio::spawn(async move {
             // Call the slave IO handler for the new slave
-            let result = handle_slave_io(new_slave_clone, slave_rx, proxy_manager_clone).await;
+            let result = handle_slave_io(new_slave_clone, slave_rx, proxy_manager_clone, buffer_pool_clone).await;
             if let Err(e) = result {
                 error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
             }
@@ -635,6 +725,10 @@ async fn main() -> io::Result<()>  {
     // Initialize the semaphore for rate limiting
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
 
+    // Initialize buffer pool
+    let slave_buffer_pool = Arc::new(ShardedBufferPool::new(NUM_SHARDS, POOL_SIZE));
+    let client_buffer_pool = Arc::new(ShardedBufferPool::new(NUM_SHARDS, POOL_SIZE));
+
     if matches.opt_count("t") > 0 {
         let master_addr: String = matches.opt_str("t").unwrap_or_else(|| {
             error!("Not found listen port. eg: net-relay -t 0.0.0.0:8000 -s 0.0.0.0:1080");
@@ -658,8 +752,9 @@ async fn main() -> io::Result<()>  {
 
         tokio::spawn({
             let proxy_manager = Arc::clone(&proxy_manager);
+            let buffer_pool_clone = Arc::clone(&slave_buffer_pool);
             async move {
-                if let Err(e) = handle_slave_connections(slave_listener, proxy_manager).await {
+                if let Err(e) = handle_slave_connections(slave_listener, proxy_manager, buffer_pool_clone).await {
                     error!("Connection handler error: {}", e);
                 }
             }
@@ -698,7 +793,16 @@ async fn main() -> io::Result<()>  {
                 // Spawn a task to handle traffic between the client and the assigned slave
                 let proxy_manager_clone = Arc::clone(&proxy_manager);
                 let semaphore_clone = Arc::clone(&semaphore);
-                tokio::spawn(handle_client_io(session_id, client, slave_tx, client_rx, proxy_manager_clone, semaphore_clone));
+                let buffer_pool_clone = Arc::clone(&client_buffer_pool);
+                tokio::spawn(handle_client_io(
+                    session_id,
+                    client,
+                    slave_tx,
+                    client_rx,
+                    proxy_manager_clone,
+                    semaphore_clone,
+                    buffer_pool_clone
+                ));
             }
         }
     } else {

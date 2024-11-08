@@ -12,6 +12,7 @@ license = "MIT"
 simple_logger = "2.1.0"
 log = "0.4.14"
 dashmap = "5"
+bytes = "1"
 tokio = { version = "1", features = ["full"] }
 getopts = "0.2"
 net2 = "0.2"
