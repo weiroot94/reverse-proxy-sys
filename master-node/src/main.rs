@@ -135,7 +135,6 @@ struct Slave {
     tx: mpsc::Sender<(u32, Bytes)>,
     // Track the last successful heartbeat time
     last_seen: Arc<AsyncMutex<Instant>>,
-    is_disconnected: Arc<AtomicBool>,
 }
 
 impl Slave {
@@ -148,7 +147,6 @@ impl Slave {
             stream: Arc::new(AsyncMutex::new(stream)),
             tx,
             last_seen: Arc::new(AsyncMutex::new(Instant::now())),
-            is_disconnected: Arc::new(AtomicBool::new(false)),
         };
         (slave, rx)
     }
@@ -265,21 +263,6 @@ impl ProxyManager {
         }
     }
 
-    async fn monitor_slave_health(self: Arc<Self>, slave: Slave) {
-        let timeout_duration = Duration::from_secs(20);
-        loop {
-            tokio::time::sleep(Duration::from_secs(KEEP_ALIVE_DURATION)).await;
-
-            let last_seen = *slave.last_seen.lock().await;
-            if last_seen.elapsed() > timeout_duration {
-                warn!("Slave {} timed out.", slave.ip_addr);
-                slave.is_disconnected.store(true, Ordering::Relaxed);
-                self.handle_slave_disconnection(&slave.ip_addr).await;
-                break;
-            }
-        }
-    }
-
     async fn handle_slave_disconnection(&self, slave_ip: &str) {
         info!("Slave {} disconnected", slave_ip);
         if self.slaves.remove(slave_ip).is_some() {
@@ -378,7 +361,6 @@ async fn handle_slave_io(
     // Prepare the commands
     let speed_check_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
     let version_check_command = build_version_check_command();
-    let heartbeat_command = build_heartbeat_command();
 
     // Send commands concurrently by spawning async tasks
     {
@@ -397,14 +379,12 @@ async fn handle_slave_io(
     }
 
     // Heartbeat setup
-    let mut heartbeat_interval = time::interval(Duration::from_secs(KEEP_ALIVE_DURATION));
+    let mut heartbeat_interval = Duration::from_secs(KEEP_ALIVE_DURATION);
+    let mut heartbeat_timer = time::interval(heartbeat_interval);
+    let max_heartbeat_timeout = Duration::from_secs(KEEP_ALIVE_DURATION * 3);
+    let mut last_seen = Instant::now();
 
     loop {
-        if slave.is_disconnected.load(Ordering::Relaxed) {
-            info!("Slave {} already marked as disconnected. Exiting IO handler.", slave.ip_addr);
-            return Ok(());
-        }
-
         tokio::select! {
             // Handle incoming traffic from the slave
             len = slave.read_stream(&mut buffer) => {
@@ -412,6 +392,8 @@ async fn handle_slave_io(
                 if len == 0 {
                     break;  // Slave connection closed
                 }
+
+                last_seen = Instant::now();
 
                 while buffer.len() >= 10 {
                     let (current_packet_type, session_id, payload_len, current_command_type) = parse_header(&buffer);
@@ -442,17 +424,42 @@ async fn handle_slave_io(
             Some((client_session_id, client_data)) = cli_rx.recv() => {
                 trace!("Master -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
                 let frame = build_data_frame(client_session_id, &client_data);
-                slave.write_stream(&frame).await?;
+                if let Err(e) = slave.write_stream(&frame).await {
+                    error!("Failed to write to slave {}: {}", slave.ip_addr, e);
+                    break;
+                }
             }
 
             // Heartbeat timer to send periodic heartbeats to the slave
-            _ = heartbeat_interval.tick() => {
-                slave.write_stream(&heartbeat_command).await?;
+            _ = heartbeat_timer.tick() => {
+                if last_seen.elapsed() > max_heartbeat_timeout {
+                    warn!("Slave {} did not respond within the maximum allowed time. Disconnecting.", slave.ip_addr);
+                    break;
+                }
+
+                let heartbeat_command = build_heartbeat_command();
+                if let Err(e) = slave.write_stream(&heartbeat_command).await {
+                    warn!("Heartbeat failed for slave {}: {}", slave.ip_addr, e);
+                    break;
+                }
+
+                trace!("Sent heartbeat to slave {}", slave.ip_addr);
+
+                if last_seen.elapsed() < Duration::from_secs(KEEP_ALIVE_DURATION * 2) {
+                    heartbeat_interval = Duration::from_secs(KEEP_ALIVE_DURATION * 2); // Double interval for responsive slaves
+                } else {
+                    heartbeat_interval = Duration::from_secs(KEEP_ALIVE_DURATION); // Reset interval for slower slaves
+                }
+                heartbeat_timer = time::interval(heartbeat_interval);
             }
         }
     }
     
     buffer_pool.return_buffer(shard_id, buffer).await;
+
+    // Handle disconnection
+    proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
+
     Ok(())
 }
 
@@ -486,9 +493,6 @@ async fn process_packet(
                     if payload.as_ref() == b"ALIVE" {
                         slave.update_last_seen().await;
                         trace!("Received heartbeat response from slave {}", slave.ip_addr);
-                    } else {
-                        warn!("Invalid heartbeat response from slave {}: {:?}", slave.ip_addr, payload);
-                        proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
                     }
                 }
                 None => error!("Unknown CommandType received from slave: {}", slave.ip_addr),
@@ -613,10 +617,6 @@ async fn handle_slave_connections(
                 error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
             }
         });
-
-        // Spawn a task to monitor the slave's health
-        let proxy_manager_clone = Arc::clone(&proxy_manager);
-        tokio::spawn(proxy_manager_clone.monitor_slave_health(new_slave.clone()));
     }
 }
 
