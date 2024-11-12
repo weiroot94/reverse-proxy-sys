@@ -13,7 +13,9 @@ simple_logger = "2.1.0"
 log = "0.4.14"
 dashmap = "5"
 bytes = "1"
+hyper = { version = "0.14", features = ["full", "server"] }
 tokio = { version = "1", features = ["full"] }
+prometheus = "0.13"
 getopts = "0.2"
 net2 = "0.2"
 rand = "0.8.4"

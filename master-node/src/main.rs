@@ -11,6 +11,11 @@ use bytes::{BytesMut, Bytes, Buf, BufMut};
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use prometheus::{Counter, IntGauge, Registry};
+use hyper::{Body, Response};
+use hyper::service::{make_service_fn, service_fn};
+use prometheus::Encoder;
+use prometheus::TextEncoder;
 
 const KEEP_ALIVE_DURATION: u64 = 10;
 const MAX_BUF_SIZE: usize = 8192;
@@ -20,6 +25,115 @@ const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 const POOL_SIZE: usize = 50;
 const NUM_SHARDS: usize = 8;
+
+// Metrics and Observability
+struct Metrics {
+    slave_active_connections: IntGauge,
+    slave_total_connections: Counter,
+    slave_disconnections: Counter,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            slave_active_connections: IntGauge::new(
+                "slave_active_connections",
+                "Current number of active slave connections",
+            )
+            .unwrap(),
+
+            slave_total_connections: Counter::new(
+                "slave_total_connections",
+                "Total number of slave connections made",
+            )
+            .unwrap(),
+
+            slave_disconnections: Counter::new(
+                "slave_disconnections",
+                "Total number of slave disconnections",
+            )
+            .unwrap(),
+        }
+    }
+
+    fn register(&self, registry: &Registry) {
+        registry.register(Box::new(self.slave_active_connections.clone())).unwrap();
+        registry.register(Box::new(self.slave_total_connections.clone())).unwrap();
+        registry.register(Box::new(self.slave_disconnections.clone())).unwrap();
+    }
+}
+
+pub async fn start_metrics_server(registry: Arc<Registry>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let make_svc = make_service_fn(move |_| {
+        let registry = registry.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |_req| {
+                let registry = registry.clone();
+                async move {
+                    // Collect metrics into a string
+                    let mut buffer = Vec::new();
+                    let encoder = TextEncoder::new();
+                    encoder.encode(&registry.gather(), &mut buffer).unwrap();
+
+                    // Format metrics into a JavaScript-driven live dashboard
+                    let metrics = String::from_utf8(buffer).unwrap();
+                    let html = format!(
+                        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metrics Dashboard</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        h1 {{ color: #2c3e50; }}
+        pre {{ background: #ecf0f1; padding: 15px; border-radius: 5px; overflow-x: auto; }}
+        .timestamp {{ color: #7f8c8d; font-size: 0.9em; }}
+    </style>
+</head>
+<body>
+    <h1>Metrics Dashboard</h1>
+    <p class="timestamp">Last updated: <span id="timestamp"></span></p>
+    <pre id="metrics">{}</pre>
+    <script>
+        async function fetchMetrics() {{
+            try {{
+                const response = await fetch(window.location.href);
+                const text = await response.text();
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(text, 'text/html');
+                const metrics = doc.querySelector('pre').innerText;
+
+                document.getElementById('metrics').innerText = metrics;
+                document.getElementById('timestamp').innerText = new Date().toLocaleTimeString();
+            }} catch (err) {{
+                console.error('Failed to fetch metrics:', err);
+            }}
+        }}
+
+        // Refresh every 5 seconds
+        setInterval(fetchMetrics, 5000);
+        // Initial timestamp
+        document.getElementById('timestamp').innerText = new Date().toLocaleTimeString();
+    </script>
+</body>
+</html>"#,
+                        metrics
+                    );
+
+                    Ok::<_, hyper::Error>(Response::new(Body::from(html)))
+                }
+            }))
+        }
+    });
+
+    let addr = ([0, 0, 0, 0], 9090).into();
+    let server = hyper::Server::bind(&addr).serve(make_svc);
+
+    println!("Metrics server running on http://{}", addr);
+    server.await?;
+    Ok(())
+}
 
 // Sharded Buffer Pool for high concurrency
 #[derive(Clone)]
@@ -352,9 +466,13 @@ async fn handle_slave_io(
     mut cli_rx: mpsc::Receiver<(u32, Bytes)>,
     proxy_manager: Arc<ProxyManager>,
     buffer_pool: Arc<ShardedBufferPool>,
+    metrics: Arc<Metrics>,
 ) -> Result<(), std::io::Error> {
     let shard_id = hash_ip(&slave.ip_addr);
     let mut buffer = buffer_pool.get_buffer(shard_id).await;
+
+    metrics.slave_active_connections.inc();
+    metrics.slave_total_connections.inc();
 
     // Prepare the commands
     let speed_check_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
@@ -458,6 +576,9 @@ async fn handle_slave_io(
     // Handle disconnection
     proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
 
+    metrics.slave_active_connections.dec();
+    metrics.slave_disconnections.inc();
+
     Ok(())
 }
 
@@ -476,7 +597,7 @@ async fn process_packet(
                     let speed_str = String::from_utf8(payload.to_vec()).unwrap_or_default();
                     if let Ok(speed) = speed_str.parse::<f64>() {
                         proxy_manager.update_slave_speed(&slave.ip_addr, speed).await;
-                        info!("Slave: {} | Net speed: {:.2} Mbps", slave.ip_addr, speed);
+                        debug!("Slave: {} | Net speed: {:.2} Mbps", slave.ip_addr, speed);
                     } else {
                         warn!("Failed to parse SpeedCheck response from slave: {}", slave.ip_addr);
                     }
@@ -484,7 +605,7 @@ async fn process_packet(
                 Some(CommandType::VersionCheck) => {
                     let version = String::from_utf8(payload.to_vec()).unwrap_or_default();
                     proxy_manager.update_slave_version(&slave.ip_addr, version.clone()).await;
-                    info!("Slave: {} | Version: {}", slave.ip_addr, version);
+                    debug!("Slave: {} | Version: {}", slave.ip_addr, version);
                 }
                 Some(CommandType::Heartbeat) => {
                     // Update last_seen on valid heartbeat response
@@ -587,7 +708,8 @@ async fn handle_client_io(
 async fn handle_slave_connections(
     slave_listener: TcpListener,
     proxy_manager: Arc<ProxyManager>,
-    buffer_pool: Arc<ShardedBufferPool>
+    buffer_pool: Arc<ShardedBufferPool>,
+    metrics: Arc<Metrics>,
 ) -> Result<(), Box<dyn Error>> {
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
@@ -608,9 +730,16 @@ async fn handle_slave_connections(
         let proxy_manager_clone = Arc::clone(&proxy_manager);
         let new_slave_clone = new_slave.clone();
         let buffer_pool_clone = Arc::clone(&buffer_pool);
+        let metrics_clone = Arc::clone(&metrics);
         tokio::spawn(async move {
             // Call the slave IO handler for the new slave
-            let result = handle_slave_io(new_slave_clone, slave_rx, proxy_manager_clone, buffer_pool_clone).await;
+            let result = handle_slave_io(
+                new_slave_clone,
+                slave_rx,
+                proxy_manager_clone,
+                buffer_pool_clone,
+                metrics_clone
+            ).await;
             if let Err(e) = result {
                 error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
             }
@@ -691,6 +820,13 @@ async fn main() -> io::Result<()>  {
     
     ::log::set_max_level(level_filter);
 
+    // Measuring metrics
+    let metrics = Arc::new(Metrics::new());
+    let registry = Registry::new();
+    metrics.register(&registry);
+
+    tokio::spawn(start_metrics_server(Arc::new(registry)));
+
     // Global store of proxy system
     let proxy_manager = Arc::new(ProxyManager {
         client_assign_mode,
@@ -730,8 +866,14 @@ async fn main() -> io::Result<()>  {
         tokio::spawn({
             let proxy_manager = Arc::clone(&proxy_manager);
             let buffer_pool_clone = Arc::clone(&slave_buffer_pool);
+            let metrics_clone = Arc::clone(&metrics);
             async move {
-                if let Err(e) = handle_slave_connections(slave_listener, proxy_manager, buffer_pool_clone).await {
+                if let Err(e) = handle_slave_connections(
+                    slave_listener,
+                    proxy_manager,
+                    buffer_pool_clone,
+                    metrics_clone
+                ).await {
                     error!("Connection handler error: {}", e);
                 }
             }
@@ -778,7 +920,7 @@ async fn main() -> io::Result<()>  {
                     client_rx,
                     proxy_manager_clone,
                     semaphore_clone,
-                    buffer_pool_clone
+                    buffer_pool_clone,
                 ));
             }
         }
