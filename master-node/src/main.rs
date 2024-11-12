@@ -50,11 +50,6 @@ async fn main() -> io::Result<()>  {
                 "proxy_mode",
                 "Set the proxy mode: stick (1) or nonstick (2)",
                 "MODE");
-    
-    opts.optopt("r",
-                "slave_recovery",
-                "Set the slave recovery mode: wait (1) or reconnect (2). Only available when proxy_mode=stick",
-                "MODE");
 
     opts.optopt("v",
                 "verbosity",
