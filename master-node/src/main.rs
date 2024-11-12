@@ -1,6 +1,5 @@
 use dashmap::DashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
 use log::{trace, debug, info, warn, error, LevelFilter};
 use simple_logger::SimpleLogger;
 use getopts::Options;
@@ -188,7 +187,6 @@ impl Client {
 struct ProxyManager {
     // Mode how master node works
     client_assign_mode: u8, // 1 or 2
-    slave_recovery_mode: u8, // 1 or 2
 
     // Slaves and clients
     slaves: Arc<DashMap<String, Slave>>,
@@ -668,26 +666,6 @@ async fn main() -> io::Result<()>  {
         }
     };
 
-    // Parse slave_recovery (wait or reconnect) only if proxy_mode is stick
-    let slave_recovery_mode: u8 = if client_assign_mode == 1 {
-        matches.opt_str("r")
-            .unwrap_or_else(|| "reconnect".to_string())
-            .parse::<String>()
-            .map(|recovery_mode| match recovery_mode.as_str() {
-                "wait" => 1,
-                "reconnect" => 2,
-                _ => {
-                    error!("Invalid slave recovery mode. Using default (reconnect).");
-                    1
-                }
-            })
-            .unwrap_or(1)
-    } else {
-        // For nonstick mode, we don't handle slave_recovery
-        info!("Slave recovery is ignored in nonstick mode.");
-        0 // Use 0 to signify that slave recovery isn't relevant in nonstick mode
-    };
-
     // Determine the verbosity level
     let verbosity = matches.opt_str("v").unwrap_or_else(|| "info".to_string());
 
@@ -716,7 +694,6 @@ async fn main() -> io::Result<()>  {
     // Global store of proxy system
     let proxy_manager = Arc::new(ProxyManager {
         client_assign_mode,
-        slave_recovery_mode,
         slaves: Arc::new(DashMap::new()),
         clients: Arc::new(DashMap::new()),
         cli_ip_to_slave: Arc::new(DashMap::new()),
