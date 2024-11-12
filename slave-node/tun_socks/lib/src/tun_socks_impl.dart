@@ -254,8 +254,8 @@ class TunSocks {
   void _cleanupConnections() {
     _masterConnLock.synchronized(() async {
       _masterConn?.close();
+      _masterConn = null;
     });
-    _masterConn = null;
     currentState = ProxyState.disconnected;
   }
 }
