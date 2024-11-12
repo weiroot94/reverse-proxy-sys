@@ -14,36 +14,45 @@ Map<int, Socks5Session> sessions = {};
 // Handler for SOCKS5 server connections
 class Socks5Session {
   final int sessionId;
-  final Socket? _master_conn;
-  Socket? _dest_conn;
-  final _destConnLock = Lock();
+  final Socket? _masterConn;
+  Socket? _destConn;
+  final Lock _destConnLock = Lock();
   States currentState = States.handshake;
   final Function(int, List<int>) _sendDataToMaster;
 
-  Socks5Session(this.sessionId, this._master_conn, this._sendDataToMaster);
+  Socks5Session(this.sessionId, this._masterConn, this._sendDataToMaster);
 
   Future<void> processSocks5Data(List<int> data) async {
     try {
         switch (currentState) {
           case States.handshake:
-            if (data.length < 2) return;
+            if (data.length < 2) {
+              _onSessionError('Invalid handshake data length');
+              return;
+            }
 
-            // Check version
-            if (data[0] != 5) return;
+            if (data[0] != 5) {
+              _onSessionError('Unsupported SOCKS version');
+              return;
+            }
 
-            // Respond with method selection
-            await _sendToClient(Uint8List.fromList([5, 0]));
+            await _sendToClient(Uint8List.fromList([5, 0])); // No authentication required
             currentState = States.handling;
             break;
 
           case States.handling:
-            if (data.length < 4) return;
+            if (data.length < 4) {
+              _onSessionError('Invalid handling data length');
+              return;
+            }
 
-            if (data[0] != 5) return _master_conn?.close();
+            if (data[0] != 5) {
+              _onSessionError('Invalid handling SOCKS version');
+              return;
+            }
 
-            // Check command
             if (data[1] != 1) {
-              _master_conn?.close();
+              _onSessionError('Unsupported command (not CONNECT)');
               return;
             }
 
@@ -51,7 +60,7 @@ class Socks5Session {
             final addrType = data[3];
 
             String address;
-            int port = 0;
+            int port;
 
             switch (addrType) {
               case 0x01: // IPv4
@@ -71,28 +80,23 @@ class Socks5Session {
                 break;
 
               default:
-                print('Unknown address type: $addrType');
+                _onSessionError('Unsupported address type: $addrType');
                 return;
             }
 
             try {
-              _dest_conn = await Socket.connect(address, port, timeout: Duration(seconds: 10));
+              _destConn = await Socket.connect(address, port, timeout: Duration(seconds: 10));
               currentState = States.proxying;
 
-              _dest_conn?.listen((data) async {
-                await _sendToClient(data);
-              }, onDone: () {
-                _closeSession();
-              }, onError: (error) {
-                print('Error on destination connection: $error');
-                _closeSession();
-              });
+              _destConn?.listen(
+                (data) => _sendToClient(data),
+                onDone: _onSessionClosed,
+                onError: (error) => _onSessionError('Destination connection error: $error'),
+              );
 
-              // Respond to client
               await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
             } catch (e) {
-              print('Connection to $address:$port failed to resolve: $e');
-              _closeSession();
+              _onSessionError('Failed to connect to $address:$port: $e');
             }
             break;
 
@@ -101,8 +105,7 @@ class Socks5Session {
             break;
       }
     } catch (e) {
-      print('Error in session $sessionId: $e');
-      _closeSession();
+      _onSessionError('Unexpected error in session $sessionId: $e');
     }
   }
 
@@ -110,27 +113,36 @@ class Socks5Session {
     try {
       await _sendDataToMaster(sessionId, data);
     } catch (e) {
-      print('Failed to send data to master: $e');
+      _onSessionError('Failed to send data to master: $e');
     }
   }
 
   Future<void> _sendToDest(List<int> data) async {
     await _destConnLock.synchronized(() async {
-      if (_dest_conn != null) {
+      if (_destConn != null) {
         try {
-          _dest_conn?.add(data);
-          await _dest_conn?.flush();
+          _destConn?.add(data);
+          await _destConn?.flush();
         } catch (e) {
-          print('Failed to send data to destination: $e');
+          _onSessionError('Failed to send data to destination: $e');
         }
       }
     });
   }
 
+  void _onSessionError(String message) {
+    print(message);
+    _closeSession();
+  }
+
+  void _onSessionClosed() {
+    _closeSession();
+  }
+
   void _closeSession() async {
     await _destConnLock.synchronized(() async {
-      await _dest_conn?.close();
-      _dest_conn = null;
+      await _destConn?.close();
+      _destConn = null;
     });
 
     // Remove session from sessions map
