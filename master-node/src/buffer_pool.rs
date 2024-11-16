@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use log::debug;
+use log::{trace, debug};
 use std::{
     collections::VecDeque,
     sync::Arc,
@@ -53,15 +53,14 @@ impl BufferPoolShard {
         let mut buffers = self.buffers.lock().await;
         if let Some(mut buffer) = buffers.pop_front() {
             if buffer.capacity() < MAX_BUF_SIZE {
-                debug!("Discarding undersized buffer, creating new one");
+                trace!("Discarding undersized buffer, creating new one");
                 buffer = BytesMut::with_capacity(MAX_BUF_SIZE);
             } else {
                 buffer.clear(); // Prepare buffer for reuse
             }
-            debug!("Borrowed buffer: capacity = {}", buffer.capacity());
             buffer
         } else {
-            debug!("No available buffer, creating new one");
+            trace!("No available buffer, creating new one");
             BytesMut::with_capacity(MAX_BUF_SIZE)
         }
     }
@@ -69,7 +68,6 @@ impl BufferPoolShard {
     async fn return_buffer(&self, buffer: BytesMut) {
         let mut buffers = self.buffers.lock().await;
         if buffers.len() < POOL_SIZE {
-            debug!("Returning buffer to pool: capacity = {}", buffer.capacity());
             buffers.push_back(buffer);
         } else {
             debug!("Buffer pool full, discarding buffer");

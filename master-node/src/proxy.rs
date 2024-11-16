@@ -30,8 +30,6 @@ pub struct Slave {
     stream: Arc<AsyncMutex<TcpStream>>,
     // Sender to receive data from clients
     tx: mpsc::Sender<(u32, Bytes)>,
-    // Track the last successful heartbeat time
-    last_seen: Arc<AsyncMutex<Instant>>,
 }
 
 impl Slave {
@@ -43,7 +41,6 @@ impl Slave {
             net_speed: 0.0,
             stream: Arc::new(AsyncMutex::new(stream)),
             tx,
-            last_seen: Arc::new(AsyncMutex::new(Instant::now())),
         };
         (slave, rx)
     }
@@ -60,11 +57,6 @@ impl Slave {
         stream.write_all(frame).await?;
         stream.flush().await?;
         Ok(())
-    }
-
-    pub async fn update_last_seen(&self) {
-        let mut last_seen = self.last_seen.lock().await;
-        *last_seen = Instant::now();
     }
 }
 
@@ -160,10 +152,8 @@ impl ProxyManager {
     }
 
     pub async fn handle_slave_disconnection(&self, slave_ip: &str) {
-        info!("Slave {} disconnected", slave_ip);
-        if self.slaves.remove(slave_ip).is_some() {
-            debug!("Removed disconnected slave: {}", slave_ip);
-        }
+        debug!("Slave {} disconnected", slave_ip);
+        self.slaves.remove(slave_ip);
     }
 }
 
@@ -185,27 +175,18 @@ pub async fn handle_slave_io(
     let speed_check_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
     let version_check_command = build_version_check_command();
 
-    // Send commands concurrently by spawning async tasks
-    {
-        let slave_clone = slave.clone(); // Clone to move into async task
-        let send_speed_check = tokio::spawn(async move {
-            slave_clone.write_stream(&speed_check_command).await
-        });
+    // Send commands concurrently
+    tokio::try_join!(
+        slave.write_stream(&speed_check_command),
+        slave.write_stream(&version_check_command),
+    )?;
 
-        let slave_clone = slave.clone(); // Another clone for version check
-        let send_version_check = tokio::spawn(async move {
-            slave_clone.write_stream(&version_check_command).await
-        });
-
-        // Await both tasks to ensure commands are sent before proceeding
-        let _ = tokio::try_join!(send_speed_check, send_version_check)?;
-    }
-
-    // Heartbeat setup
-    let mut heartbeat_interval = Duration::from_secs(KEEP_ALIVE_DURATION);
-    let mut heartbeat_timer = time::interval(heartbeat_interval);
     let max_heartbeat_timeout = Duration::from_secs(KEEP_ALIVE_DURATION * 3);
+    let heartbeat_interval = Duration::from_secs(KEEP_ALIVE_DURATION);
     let mut last_seen = Instant::now();
+    let mut last_heartbeat_sent = Instant::now();
+
+    let mut error_occurred = false;
 
     loop {
         tokio::select! {
@@ -232,14 +213,24 @@ pub async fn handle_slave_io(
 
                     debug!("Processing packet from slave: {} | PacketType: {:?} | CommandType: {:?}", 
                           slave.ip_addr, current_packet_type, current_command_type);
-                    process_packet(
+
+                    if let Err(_err) = process_packet(
                         current_packet_type,
                         current_command_type,
                         payload,
                         session_id,
                         &slave,
-                        &proxy_manager
-                    ).await?;
+                        &proxy_manager,
+                        &mut last_seen,
+                    ).await {
+                        trace!("Critical error processing packet: {}. Exiting loop.", _err);
+                        error_occurred = true;
+                        break;
+                    }
+
+                    if error_occurred {
+                        break;
+                    }
                 }
             }
 
@@ -253,28 +244,30 @@ pub async fn handle_slave_io(
                 }
             }
 
-            // Heartbeat timer to send periodic heartbeats to the slave
-            _ = heartbeat_timer.tick() => {
-                if last_seen.elapsed() > max_heartbeat_timeout {
-                    warn!("Slave {} did not respond within the maximum allowed time. Disconnecting.", slave.ip_addr);
-                    break;
+            // Periodically send heartbeat
+            _ = tokio::time::sleep_until(last_heartbeat_sent + heartbeat_interval) => {
+                if last_heartbeat_sent.elapsed() >= heartbeat_interval {
+                    let heartbeat_command = build_heartbeat_command();
+                    if let Err(err) = slave.write_stream(&heartbeat_command).await {
+                        warn!("Failed to send heartbeat to slave {}: {}. Disconnecting.", slave.ip_addr, err);
+                        return Err(err);
+                    }
+                    trace!("Sent heartbeat to slave {}", slave.ip_addr);
+                    last_heartbeat_sent = Instant::now();
                 }
-
-                let heartbeat_command = build_heartbeat_command();
-                if let Err(e) = slave.write_stream(&heartbeat_command).await {
-                    warn!("Heartbeat failed for slave {}: {}", slave.ip_addr, e);
-                    break;
-                }
-
-                trace!("Sent heartbeat to slave {}", slave.ip_addr);
-
-                if last_seen.elapsed() < Duration::from_secs(KEEP_ALIVE_DURATION * 2) {
-                    heartbeat_interval = Duration::from_secs(KEEP_ALIVE_DURATION * 2); // Double interval for responsive slaves
-                } else {
-                    heartbeat_interval = Duration::from_secs(KEEP_ALIVE_DURATION); // Reset interval for slower slaves
-                }
-                heartbeat_timer = time::interval(heartbeat_interval);
             }
+
+            // Monitor for heartbeat timeout
+            _ = tokio::time::sleep_until(last_seen + max_heartbeat_timeout) => {
+                if last_seen.elapsed() >= max_heartbeat_timeout {
+                    warn!("Slave {} did not respond within the maximum allowed time. Disconnecting.", slave.ip_addr);
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Heartbeat timeout"));
+                }
+            }
+        }
+
+        if error_occurred {
+            break;
         }
     }
     
@@ -381,7 +374,7 @@ pub async fn handle_slave_connections(
             Ok(p) => p,
         };
 
-        info!("New Slave {}:{}", slave_addr.ip(), slave_addr.port());
+        debug!("New Slave {}:{}", slave_addr.ip(), slave_addr.port());
 
         // Create a new Slave object
         let (new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);

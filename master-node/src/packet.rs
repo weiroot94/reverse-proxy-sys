@@ -1,9 +1,12 @@
 use crate::proxy:: {ProxyManager, Slave};
 use crate::utils::bytes_to_u32;
 
-use log::{trace, debug, warn, error};
+use log::{trace, debug, warn, info, error};
 use std::sync::Arc;
+use tokio::time::Instant;
 use bytes::{BytesMut, Bytes, BufMut};
+
+const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.4"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PacketType {
@@ -102,6 +105,7 @@ pub async fn process_packet(
     session_id: u32,
     slave: &Slave,
     proxy_manager: &Arc<ProxyManager>,
+    last_seen: &mut Instant,
 ) -> Result<(), std::io::Error> {
     match packet_type {
         Some(PacketType::Command) => {
@@ -110,20 +114,30 @@ pub async fn process_packet(
                     let speed_str = String::from_utf8(payload.to_vec()).unwrap_or_default();
                     if let Ok(speed) = speed_str.parse::<f64>() {
                         proxy_manager.update_slave_speed(&slave.ip_addr, speed).await;
-                        debug!("Slave: {} | Net speed: {:.2} Mbps", slave.ip_addr, speed);
+                        info!("Slave: {} | Net speed: {:.2} Mbps", slave.ip_addr, speed);
                     } else {
                         warn!("Failed to parse SpeedCheck response from slave: {}", slave.ip_addr);
                     }
                 }
                 Some(CommandType::VersionCheck) => {
                     let version = String::from_utf8(payload.to_vec()).unwrap_or_default();
-                    proxy_manager.update_slave_version(&slave.ip_addr, version.clone()).await;
-                    debug!("Slave: {} | Version: {}", slave.ip_addr, version);
+
+                    // Check if the version is allowed
+                    if ALLOWED_SLAVE_VERSIONS.contains(&version.as_str()) {
+                        proxy_manager.update_slave_version(&slave.ip_addr, version.clone()).await;
+                        debug!("Slave: {} | Accepted Version: {}", slave.ip_addr, version);
+                    } else {
+                        debug!("Slave {} has unsupported version: {}", slave.ip_addr, version);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Unsupported slave version",
+                        ));
+                    }
                 }
                 Some(CommandType::Heartbeat) => {
                     // Update last_seen on valid heartbeat response
                     if payload.as_ref() == b"ALIVE" {
-                        slave.update_last_seen().await;
+                        *last_seen = Instant::now();
                         trace!("Received heartbeat response from slave {}", slave.ip_addr);
                     }
                 }
