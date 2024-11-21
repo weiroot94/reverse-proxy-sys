@@ -15,7 +15,7 @@ use crate::proxy::{
 use crate::utils::{usage, MAX_CONCURRENT_REQUESTS};
 
 use dashmap::DashMap;
-use log::{debug, error, info, LevelFilter};
+use log::{debug, error, warn, info, LevelFilter};
 use simple_logger::SimpleLogger;
 use getopts::Options;
 use std::sync::Arc;
@@ -199,6 +199,8 @@ async fn main() -> io::Result<()>  {
                     semaphore_clone,
                     buffer_pool_clone,
                 ));
+            } else {
+                warn!("No avaliable slaves to be assigned to client");
             }
         }
     } else {

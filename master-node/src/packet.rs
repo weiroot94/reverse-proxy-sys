@@ -6,8 +6,6 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use bytes::{BytesMut, Bytes, BufMut};
 
-const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.4"];
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PacketType {
     Data = 0x00,
@@ -110,30 +108,6 @@ pub async fn process_packet(
     match packet_type {
         Some(PacketType::Command) => {
             match command_type {
-                Some(CommandType::SpeedCheck) => {
-                    let speed_str = String::from_utf8(payload.to_vec()).unwrap_or_default();
-                    if let Ok(speed) = speed_str.parse::<f64>() {
-                        proxy_manager.update_slave_speed(&slave.ip_addr, speed).await;
-                        info!("Slave: {} | Net speed: {:.2} Mbps", slave.ip_addr, speed);
-                    } else {
-                        warn!("Failed to parse SpeedCheck response from slave: {}", slave.ip_addr);
-                    }
-                }
-                Some(CommandType::VersionCheck) => {
-                    let version = String::from_utf8(payload.to_vec()).unwrap_or_default();
-
-                    // Check if the version is allowed
-                    if ALLOWED_SLAVE_VERSIONS.contains(&version.as_str()) {
-                        proxy_manager.update_slave_version(&slave.ip_addr, version.clone()).await;
-                        debug!("Slave: {} | Accepted Version: {}", slave.ip_addr, version);
-                    } else {
-                        debug!("Slave {} has unsupported version: {}", slave.ip_addr, version);
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "Unsupported slave version",
-                        ));
-                    }
-                }
                 Some(CommandType::Heartbeat) => {
                     // Update last_seen on valid heartbeat response
                     if payload.as_ref() == b"ALIVE" {
@@ -141,7 +115,10 @@ pub async fn process_packet(
                         trace!("Received heartbeat response from slave {}", slave.ip_addr);
                     }
                 }
-                None => error!("Unknown CommandType received from slave: {}", slave.ip_addr),
+                _ => debug!(
+                    "Ignoring unsupported command packet from slave {}: {:?}",
+                    slave.ip_addr, command_type
+                ),
             }
         }
         Some(PacketType::Data) => {

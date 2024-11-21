@@ -69,7 +69,7 @@ class TunSocks {
   
   // Heartbeat Monitoring
   Timer? _heartbeatTimer;
-  final Duration heartbeatInterval = Duration(seconds: 15);
+  final Duration heartbeatInterval = Duration(seconds: 30);
 
   TunSocks({
     required this.host,
@@ -112,8 +112,6 @@ class TunSocks {
             print('Master connection error: $error');
             _handleDisconnection();
           });
-      
-      _manageHeartbeatTimer();
     } catch (e) {
       print('Failed to connect to master: $e');
       _handleDisconnection();

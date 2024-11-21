@@ -20,6 +20,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, Semaphore};
 use bytes::{BytesMut, Bytes, Buf};
 
 const KEEP_ALIVE_DURATION: u64 = 10;
+const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.5"];
 
 #[derive(Clone)]
 pub struct Slave {
@@ -57,6 +58,14 @@ impl Slave {
         stream.write_all(frame).await?;
         stream.flush().await?;
         Ok(())
+    }
+
+    pub fn set_version(&mut self, version: String) {
+        self.version = Some(version);
+    }
+
+    pub fn set_speed(&mut self, speed: f64) {
+        self.net_speed = speed;
     }
 }
 
@@ -139,18 +148,6 @@ impl ProxyManager {
         }
     }
 
-    pub async fn update_slave_speed(&self, slave_ip: &str, net_speed: f64) {
-        if let Some(mut slave) = self.slaves.get_mut(slave_ip) {
-            slave.net_speed = net_speed;
-        }
-    }
-
-    pub async fn update_slave_version(&self, slave_ip: &str, version: String) {
-        if let Some(mut slave) = self.slaves.get_mut(slave_ip) {
-            slave.version = Some(version.clone());
-        }
-    }
-
     pub async fn handle_slave_disconnection(&self, slave_ip: &str) {
         debug!("Slave {} disconnected", slave_ip);
         self.slaves.remove(slave_ip);
@@ -170,16 +167,6 @@ pub async fn handle_slave_io(
 
     metrics.slave_active_connections.inc();
     metrics.slave_total_connections.inc();
-
-    // Prepare the commands
-    let speed_check_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
-    let version_check_command = build_version_check_command();
-
-    // Send commands concurrently
-    tokio::try_join!(
-        slave.write_stream(&speed_check_command),
-        slave.write_stream(&version_check_command),
-    )?;
 
     let max_heartbeat_timeout = Duration::from_secs(KEEP_ALIVE_DURATION * 3);
     let heartbeat_interval = Duration::from_secs(KEEP_ALIVE_DURATION);
@@ -261,6 +248,15 @@ pub async fn handle_slave_io(
             _ = tokio::time::sleep_until(last_seen + max_heartbeat_timeout) => {
                 if last_seen.elapsed() >= max_heartbeat_timeout {
                     warn!("Slave {} did not respond within the maximum allowed time. Disconnecting.", slave.ip_addr);
+
+                    buffer_pool.return_buffer(shard_id, buffer).await;
+
+                    // Handle disconnection
+                    proxy_manager.handle_slave_disconnection(&slave.ip_addr).await;
+
+                    metrics.slave_active_connections.dec();
+                    metrics.slave_disconnections.inc();
+
                     return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Heartbeat timeout"));
                 }
             }
@@ -374,21 +370,27 @@ pub async fn handle_slave_connections(
             Ok(p) => p,
         };
 
-        debug!("New Slave {}:{}", slave_addr.ip(), slave_addr.port());
+        trace!("New Slave attempting to connect: {}:{}", slave_addr.ip(), slave_addr.port());
 
         // Create a new Slave object
-        let (new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
-        proxy_manager.slaves.insert(new_slave.ip_addr.clone(), new_slave.clone());
+        let (mut new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
 
         // Spawn a task to handle the slave's I/O operations
         let proxy_manager_clone = Arc::clone(&proxy_manager);
-        let new_slave_clone = new_slave.clone();
         let buffer_pool_clone = Arc::clone(&buffer_pool);
         let metrics_clone = Arc::clone(&metrics);
+
         tokio::spawn(async move {
+            if let Err(e) = verify_slave_session(&mut new_slave,).await {
+                warn!("Slave {} validation failed: {}", new_slave.ip_addr, e);
+                return;
+            }
+    
+            proxy_manager_clone.slaves.insert(new_slave.ip_addr.clone(), new_slave.clone());
+
             // Call the slave IO handler for the new slave
             let result = handle_slave_io(
-                new_slave_clone,
+                new_slave,
                 slave_rx,
                 proxy_manager_clone,
                 buffer_pool_clone,
@@ -401,3 +403,50 @@ pub async fn handle_slave_connections(
     }
 }
 
+async fn verify_slave_session(
+    temp_slave: &mut Slave,
+) -> Result<(), Box<dyn Error>> {
+    // Step 1: Perform Version Check
+    let version_command = build_version_check_command();
+    temp_slave.write_stream(&version_command).await?;
+    let mut buffer = BytesMut::with_capacity(1024);
+    temp_slave.read_stream(&mut buffer).await?;
+    let (_, _, payload_len, _) = parse_header(&buffer);
+
+    if payload_len == 0 || buffer.len() < 10 + payload_len {
+        return Err("Invalid or empty version response".into());
+    }
+
+    buffer.advance(10);
+    let version = String::from_utf8(buffer.split_to(payload_len).to_vec())?;
+    if !ALLOWED_SLAVE_VERSIONS.contains(&version.as_str()) {
+        return Err(format!("Slave {} has unsupported version: {}", temp_slave.ip_addr, version).into());
+    }
+    temp_slave.set_version(version.clone());
+    debug!("Slave {} version check passed: {}", temp_slave.ip_addr, version);
+
+    // Step 2: Perform Speed Test
+    debug!("Performing speed test for slave {}", temp_slave.ip_addr);
+    let speed_test_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
+    temp_slave.write_stream(&speed_test_command).await?;
+    buffer.clear();
+    temp_slave.read_stream(&mut buffer).await?;
+    let (_, _, payload_len, _) = parse_header(&buffer);
+
+    if payload_len == 0 || buffer.len() < 10 + payload_len {
+        return Err("Invalid or empty speed test response".into());
+    }
+
+    buffer.advance(10);
+    let speed_str = String::from_utf8(buffer.split_to(payload_len).to_vec())?;
+    let speed = speed_str.parse::<f64>()?;
+    temp_slave.set_speed(speed);
+    debug!("Slave {} speed test passed: {:.2} Mbps", temp_slave.ip_addr, speed);
+
+    // Step 3: (Optional) Perform Geolocation Check
+    // debug!("Performing geolocation check for slave {}", temp_slave.ip_addr);
+    // Placeholder: Perform geolocation check here (if needed)
+    // If geolocation fails, return an error
+
+    Ok(())
+}
