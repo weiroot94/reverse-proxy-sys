@@ -1,4 +1,4 @@
-use crate::buffer_pool::ShardedBufferPool;
+use crate::buffer_pool::{ShardedBufferPool, MAX_BUF_SIZE};
 use crate::metrics::Metrics;
 use crate::packet::{
     parse_header,
@@ -6,6 +6,7 @@ use crate::packet::{
     build_speed_test_command,
     build_heartbeat_command,
     build_version_check_command,
+    build_location_check_command,
     build_data_frame
 };
 use crate::utils::{hash_ip, CLIENT_REQUEST_TIMEOUT};
@@ -18,9 +19,10 @@ use tokio::time::{self, Duration, Instant, timeout};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, Semaphore};
 use bytes::{BytesMut, Bytes, Buf};
+use serde_json;
 
 const KEEP_ALIVE_DURATION: u64 = 10;
-const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.5"];
+const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.6"];
 
 #[derive(Clone)]
 pub struct Slave {
@@ -360,6 +362,7 @@ pub async fn handle_slave_connections(
     proxy_manager: Arc<ProxyManager>,
     buffer_pool: Arc<ShardedBufferPool>,
     metrics: Arc<Metrics>,
+    allowed_locations: Arc<Vec<String>>,
 ) -> Result<(), Box<dyn Error>> {
     loop {
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
@@ -373,31 +376,38 @@ pub async fn handle_slave_connections(
         trace!("New Slave attempting to connect: {}:{}", slave_addr.ip(), slave_addr.port());
 
         // Create a new Slave object
-        let (mut new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
+        let (new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
 
         // Spawn a task to handle the slave's I/O operations
         let proxy_manager_clone = Arc::clone(&proxy_manager);
         let buffer_pool_clone = Arc::clone(&buffer_pool);
         let metrics_clone = Arc::clone(&metrics);
 
-        tokio::spawn(async move {
-            if let Err(e) = verify_slave_session(&mut new_slave,).await {
-                warn!("Slave {} validation failed: {}", new_slave.ip_addr, e);
-                return;
-            }
-    
-            proxy_manager_clone.slaves.insert(new_slave.ip_addr.clone(), new_slave.clone());
-
-            // Call the slave IO handler for the new slave
-            let result = handle_slave_io(
-                new_slave,
-                slave_rx,
-                proxy_manager_clone,
-                buffer_pool_clone,
-                metrics_clone
-            ).await;
-            if let Err(e) = result {
-                error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
+        tokio::spawn({
+            let allowed_locations = allowed_locations.clone();
+            let mut new_slave = new_slave.clone();
+        
+            async move {
+                if let Err(e) = verify_slave_session(&mut new_slave, &allowed_locations).await {
+                    warn!("Slave {} validation failed: {}", new_slave.ip_addr, e);
+                    return;
+                }
+        
+                proxy_manager_clone.slaves.insert(new_slave.ip_addr.clone(), new_slave.clone());
+        
+                // Call the slave IO handler for the new slave
+                let result = handle_slave_io(
+                    new_slave,
+                    slave_rx,
+                    proxy_manager_clone,
+                    buffer_pool_clone,
+                    metrics_clone,
+                )
+                .await;
+        
+                if let Err(e) = result {
+                    error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
+                }
             }
         });
     }
@@ -405,11 +415,12 @@ pub async fn handle_slave_connections(
 
 async fn verify_slave_session(
     temp_slave: &mut Slave,
+    allowed_locations: &Arc<Vec<String>>,
 ) -> Result<(), Box<dyn Error>> {
     // Step 1: Perform Version Check
     let version_command = build_version_check_command();
     temp_slave.write_stream(&version_command).await?;
-    let mut buffer = BytesMut::with_capacity(1024);
+    let mut buffer = BytesMut::with_capacity(MAX_BUF_SIZE);
     temp_slave.read_stream(&mut buffer).await?;
     let (_, _, payload_len, _) = parse_header(&buffer);
 
@@ -425,7 +436,40 @@ async fn verify_slave_session(
     temp_slave.set_version(version.clone());
     debug!("Slave {} version check passed: {}", temp_slave.ip_addr, version);
 
-    // Step 2: Perform Speed Test
+    // Step 2: (Optional) Perform Geolocation Check
+    if !allowed_locations.is_empty() {
+        debug!("Performing location check for slave {}", temp_slave.ip_addr);
+        let location_command = build_location_check_command(&temp_slave.ip_addr);
+        temp_slave.write_stream(&location_command).await?;
+        buffer.clear();
+        temp_slave.read_stream(&mut buffer).await?;
+        let (_, _, payload_len, _) = parse_header(&buffer);
+
+        if payload_len == 0 || buffer.len() < 10 + payload_len {
+            return Err("Location check response is empty".into());
+        }
+
+        buffer.advance(10);
+        let location_data = String::from_utf8(buffer.split_to(payload_len).to_vec())?;
+        debug!("Received location data: {}", location_data);
+
+        // Parse the location response
+        let location: serde_json::Value = serde_json::from_str(&location_data)?;
+        if let Some(country) = location["data"]["country"].as_str() {
+            if !allowed_locations.iter().any(|loc| loc.eq_ignore_ascii_case(country)) {
+                return Err(format!(
+                    "Slave {} is in a restricted location: {}",
+                    temp_slave.ip_addr, country
+                )
+                .into());
+            }
+            debug!("Slave {} location check passed: {}", temp_slave.ip_addr, country);
+        } else {
+            return Err("Failed to parse location response".into());
+        }
+    }
+
+    // Step 3: Perform Speed Test
     debug!("Performing speed test for slave {}", temp_slave.ip_addr);
     let speed_test_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
     temp_slave.write_stream(&speed_test_command).await?;
@@ -442,11 +486,6 @@ async fn verify_slave_session(
     let speed = speed_str.parse::<f64>()?;
     temp_slave.set_speed(speed);
     debug!("Slave {} speed test passed: {:.2} Mbps", temp_slave.ip_addr, speed);
-
-    // Step 3: (Optional) Perform Geolocation Check
-    // debug!("Performing geolocation check for slave {}", temp_slave.ip_addr);
-    // Placeholder: Perform geolocation check here (if needed)
-    // If geolocation fails, return an error
 
     Ok(())
 }

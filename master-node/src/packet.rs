@@ -27,6 +27,7 @@ pub enum CommandType {
     SpeedCheck = 0x01,
     VersionCheck = 0x02,
     Heartbeat = 0x03,
+    LocationCheck = 0x04,
 }
 
 impl CommandType {
@@ -35,6 +36,7 @@ impl CommandType {
             0x01 => Some(CommandType::SpeedCheck),
             0x02 => Some(CommandType::VersionCheck),
             0x03 => Some(CommandType::Heartbeat),
+            0x04 => Some(CommandType::LocationCheck),
             _ => None,
         }
     }
@@ -66,6 +68,14 @@ pub fn build_version_check_command() -> Bytes {
 
 pub fn build_heartbeat_command() -> Bytes {
     build_command_frame(PacketType::Command, 0, Some(CommandType::Heartbeat), &[])
+}
+
+pub fn build_location_check_command(ip: &str) -> Bytes {
+    build_command_frame(PacketType::Command,
+        0,
+        Some(CommandType::LocationCheck),
+        format!("https://ipinfo.io/widget/demo/{}", ip).as_bytes(),
+    )
 }
 
 pub fn build_data_frame(session_id: u32, payload: &[u8]) -> Bytes {

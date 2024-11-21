@@ -1,2 +1,2 @@
 
-const slaveVersion = '1.0.5';
+const slaveVersion = '1.0.6';

@@ -17,6 +17,7 @@ const int commandPacket = 0x01;
 const int speedCheck = 0x01;
 const int versionCheck = 0x02;
 const int heartbeatCheck = 0x03;
+const int locationCheck = 0x04;
 
 class ProtocolPacket {
   final int sessionId;
@@ -130,6 +131,9 @@ class TunSocks {
         _sendAliveResponse();
         _manageHeartbeatTimer();
         break;
+      case locationCheck:
+        await _performLocationCheck(payload);
+        break;
       default:
         print('Unknown command received');
     }
@@ -190,6 +194,21 @@ class TunSocks {
     }
   }
 
+  Future<void> _performLocationCheck(List<int> payload) async {
+    final locationApiUrl = utf8.decode(payload);
+    try {
+      final response = await http.get(Uri.parse(locationApiUrl));
+      if (response.statusCode == 200) {
+        final locationInfo = response.body;
+        _sendLocationInfo(locationInfo);
+      } else {
+        print('Failed to fetch location data: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Error fetching location data: $e');
+    }
+  }
+
   int _bytesToInt(List<int> bytes) {
     return bytes.fold(0, (previousValue, element) => (previousValue << 8) + element);
   }
@@ -227,6 +246,11 @@ class TunSocks {
   void _sendSpeedResult(double speedMbps) {
     final payload = utf8.encode('$speedMbps');
     _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: speedCheck);
+  }
+
+  void _sendLocationInfo(String locationInfo) {
+    final payload = utf8.encode(locationInfo);
+    _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: locationCheck);
   }
 
   void _sendVersionInfo() {

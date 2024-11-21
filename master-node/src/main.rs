@@ -50,6 +50,13 @@ async fn main() -> io::Result<()>  {
                 "proxy_mode",
                 "Set the proxy mode: stick (1) or nonstick (2)",
                 "MODE");
+    
+    opts.optopt(
+                "l",
+                "allowed-locations",
+                "Comma-separated list of allowed countries for slaves",
+                "LOCATIONS",
+                );
 
     opts.optopt("v",
                 "verbosity",
@@ -67,10 +74,27 @@ async fn main() -> io::Result<()>  {
         "stick" => 1,
         "nonstick" => 2,
         _ => {
-            error!("Invalid proxy mode. Using default (stick).");
-            1
+            error!("Invalid proxy mode. Using default (nonstick).");
+            2
         }
     };
+
+    // Parse the allowed locations
+    let allowed_locations = Arc::new(
+        matches
+            .opt_str("l")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|loc| {
+                let trimmed = loc.trim();
+                if !trimmed.is_empty() {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<String>>(),
+    );
 
     // Determine the verbosity level
     let verbosity = matches.opt_str("v").unwrap_or_else(|| "info".to_string());
@@ -144,12 +168,14 @@ async fn main() -> io::Result<()>  {
             let proxy_manager = Arc::clone(&proxy_manager);
             let buffer_pool_clone = Arc::clone(&slave_buffer_pool);
             let metrics_clone = Arc::clone(&metrics);
+            let allowed_locations = allowed_locations.clone();
             async move {
                 if let Err(e) = handle_slave_connections(
                     slave_listener,
                     proxy_manager,
                     buffer_pool_clone,
-                    metrics_clone
+                    metrics_clone,
+                    allowed_locations,
                 ).await {
                     error!("Connection handler error: {}", e);
                 }
