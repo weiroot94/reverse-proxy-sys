@@ -61,7 +61,7 @@ class TunSocks {
   final String host;
   final int port;
 
-  late Socket? _masterConn;
+  Socket? _masterConn;
   final _masterConnLock = Lock();
   ProxyState currentState = ProxyState.disconnected;
   int retryAttempts = 0;
