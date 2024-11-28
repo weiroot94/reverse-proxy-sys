@@ -16,14 +16,14 @@ use dashmap::DashMap;
 use std::error::Error;
 use log::{trace, debug, info, warn, error};
 use tokio::{io::{AsyncWriteExt, AsyncReadExt}, net::{TcpListener, TcpStream}};
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{self, Duration, Instant, timeout};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, Semaphore};
 use bytes::{BytesMut, Bytes, Buf};
 use serde_json;
 
 const KEEP_ALIVE_DURATION: u64 = 10;
-const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.6"];
+const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.7"];
 
 #[derive(Clone)]
 pub struct Slave {
@@ -333,11 +333,11 @@ pub async fn handle_client_io(
                         }
                     }
                     Ok(Err(e)) => {
-                        error!("Error reading from client {}: {}", session_id, e);
+                        error!("Error reading from client session id {}: {}", session_id, e);
                         break;
                     }
                     Err(_) => {
-                        trace!("Timeout reading from client {}", session_id);
+                        trace!("Timeout reading from client session id {}", session_id);
                         break;
                     }
                 }
@@ -395,35 +395,41 @@ pub async fn handle_slave_connections(
         trace!("New Slave attempting to connect: {}:{}", slave_addr.ip(), slave_addr.port());
 
         // Create a new Slave object
-        let (mut new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
-
-        if let Err(e) = verify_slave_session(&mut new_slave, &allowed_locations).await {
-            debug!("Slave {} validation failed: {}", new_slave.ip_addr, e);
-            continue;
-        }
-
-        proxy_manager.slaves.insert(new_slave.ip_addr.clone(), new_slave.clone());
-        info!("Slave {} successfully registered.", new_slave.ip_addr);
+        let (new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
 
         // Spawn a task to handle the slave's I/O operations
         let proxy_manager_clone = Arc::clone(&proxy_manager);
+        let allowed_locations_clone = Arc::clone(&allowed_locations);
         let buffer_pool_clone = Arc::clone(&buffer_pool);
         let metrics_clone = Arc::clone(&metrics);
 
-        tokio::spawn({
-            async move {
-                // Call the slave IO handler for the new slave
-                let result = handle_slave_io(
-                    new_slave,
-                    slave_rx,
-                    proxy_manager_clone,
-                    buffer_pool_clone,
-                    metrics_clone,
-                )
-                .await;
-        
-                if let Err(e) = result {
-                    error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
+        tokio::spawn(async move {
+            let mut slave = new_slave.clone();
+            
+            // Perform validation
+            match verify_slave_session(&mut slave, &allowed_locations_clone).await {
+                Ok(_) => {
+                    debug!("Slave {} validation passed.", slave.ip_addr);
+
+                    // Add the validated slave to the proxy manager
+                    proxy_manager_clone.slaves.insert(slave.ip_addr.clone(), slave.clone());
+                    info!("Slave {} successfully registered.", new_slave.ip_addr);
+
+                    // Spawn a task to handle I/O for the validated slave
+                    if let Err(e) = handle_slave_io(
+                        slave,
+                        slave_rx,
+                        proxy_manager_clone,
+                        buffer_pool_clone,
+                        metrics_clone,
+                    )
+                    .await
+                    {
+                        error!("Error handling IO for slave {}: {}", slave_addr.ip(), e);
+                    }
+                }
+                Err(e) => {
+                    debug!("Slave {} validation failed: {}", slave.ip_addr, e);
                 }
             }
         });
@@ -433,12 +439,15 @@ pub async fn handle_slave_connections(
 async fn verify_slave_session(
     temp_slave: &mut Slave,
     allowed_locations: &Arc<Vec<String>>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Step 1: Perform Version Check
     let version_command = build_version_check_command();
     temp_slave.write_stream(&version_command).await?;
     let mut buffer = BytesMut::with_capacity(MAX_BUF_SIZE);
-    temp_slave.read_stream(&mut buffer).await?;
+
+    if let Err(_) = time::timeout(CLIENT_REQUEST_TIMEOUT, temp_slave.read_stream(&mut buffer)).await {
+        return Err("Version check response timed out".into());
+    }
     let (_, _, payload_len, _) = parse_header(&buffer);
 
     if payload_len == 0 || buffer.len() < 10 + payload_len {
@@ -458,7 +467,11 @@ async fn verify_slave_session(
         let location_command = build_location_check_command(&temp_slave.ip_addr);
         temp_slave.write_stream(&location_command).await?;
         buffer.clear();
-        temp_slave.read_stream(&mut buffer).await?;
+
+        if let Err(_) = time::timeout(CLIENT_REQUEST_TIMEOUT, temp_slave.read_stream(&mut buffer)).await {
+            return Err("Location check response timed out".into());
+        }
+        
         let (_, _, payload_len, _) = parse_header(&buffer);
 
         if payload_len == 0 || buffer.len() < 10 + payload_len {
@@ -489,7 +502,11 @@ async fn verify_slave_session(
     let speed_test_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
     temp_slave.write_stream(&speed_test_command).await?;
     buffer.clear();
-    temp_slave.read_stream(&mut buffer).await?;
+
+    if let Err(_) = time::timeout(CLIENT_REQUEST_TIMEOUT, temp_slave.read_stream(&mut buffer)).await {
+        return Err("Speed test response timed out".into());
+    }
+
     let (_, _, payload_len, _) = parse_header(&buffer);
 
     if payload_len == 0 || buffer.len() < 10 + payload_len {
