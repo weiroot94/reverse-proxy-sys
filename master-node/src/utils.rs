@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 pub const CLIENT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-pub const MAX_CONCURRENT_REQUESTS: usize = 100;
+pub const MAX_CONCURRENT_REQUESTS: usize = 30;
 
 pub fn hash_ip(ip_addr: &str) -> usize {
     let mut hasher = DefaultHasher::new();

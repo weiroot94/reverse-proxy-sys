@@ -1,7 +1,7 @@
 use crate::proxy:: {ProxyManager, Slave};
 use crate::utils::bytes_to_u32;
 
-use log::{trace, debug, warn, info, error};
+use log::{debug, error};
 use std::sync::Arc;
 use tokio::time::Instant;
 use bytes::{BytesMut, Bytes, BufMut};
@@ -28,6 +28,7 @@ pub enum CommandType {
     VersionCheck = 0x02,
     Heartbeat = 0x03,
     LocationCheck = 0x04,
+    CloseSession = 0x05,
 }
 
 impl CommandType {
@@ -37,6 +38,7 @@ impl CommandType {
             0x02 => Some(CommandType::VersionCheck),
             0x03 => Some(CommandType::Heartbeat),
             0x04 => Some(CommandType::LocationCheck),
+            0x05 => Some(CommandType::CloseSession),
             _ => None,
         }
     }
@@ -68,6 +70,10 @@ pub fn build_version_check_command() -> Bytes {
 
 pub fn build_heartbeat_command() -> Bytes {
     build_command_frame(PacketType::Command, 0, Some(CommandType::Heartbeat), &[])
+}
+
+pub fn build_close_session_command(session_id: u32) -> Bytes {
+    build_command_frame(PacketType::Command, session_id, Some(CommandType::CloseSession), &[])
 }
 
 pub fn build_location_check_command(ip: &str) -> Bytes {
@@ -122,7 +128,7 @@ pub async fn process_packet(
                     // Update last_seen on valid heartbeat response
                     if payload.as_ref() == b"ALIVE" {
                         *last_seen = Instant::now();
-                        trace!("Received heartbeat response from slave {}", slave.ip_addr);
+                        debug!("Received heartbeat response from slave {}", slave.ip_addr);
                     }
                 }
                 _ => debug!(
@@ -132,6 +138,7 @@ pub async fn process_packet(
             }
         }
         Some(PacketType::Data) => {
+            debug!("sid {}, {} bytes : SLAVE replied", session_id, payload.len());
             proxy_manager.route_to_client(session_id, payload).await;
         }
         None => {

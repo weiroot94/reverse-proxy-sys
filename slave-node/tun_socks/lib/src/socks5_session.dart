@@ -88,13 +88,14 @@ class Socks5Session {
               _destConn = await Socket.connect(address, port, timeout: Duration(seconds: 10));
               currentState = States.proxying;
 
+              await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+
               _destConn?.listen(
                 (data) => _sendToClient(data),
                 onDone: _onSessionClosed,
                 onError: (error) => _onSessionError('Destination connection error: $error'),
               );
 
-              await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
             } catch (e) {
               _onSessionError('Failed to connect to $address:$port: $e');
             }
@@ -123,6 +124,9 @@ class Socks5Session {
         try {
           _destConn?.add(data);
           await _destConn?.flush();
+        } on SocketException catch (e) {
+          print('Failed to send data to destination: $e');
+          closeSession();
         } catch (e) {
           _onSessionError('Failed to send data to destination: $e');
         }
@@ -132,21 +136,25 @@ class Socks5Session {
 
   void _onSessionError(String message) {
     print(message);
-    _closeSession();
+    closeSession();
   }
 
   void _onSessionClosed() {
-    _closeSession();
+    closeSession();
   }
 
-  void _closeSession() async {
+  void closeSession() async {
+    // Remove session from sessions map
+    sessions.remove(sessionId);
+
+    if (_destConn == null) {
+      return;
+    }
+
     await _destConnLock.synchronized(() async {
       await _destConn?.close();
       _destConn = null;
     });
-
-    // Remove session from sessions map
-    sessions.remove(sessionId);
   }
 }
 

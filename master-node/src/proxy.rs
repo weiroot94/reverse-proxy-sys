@@ -7,6 +7,7 @@ use crate::packet::{
     build_heartbeat_command,
     build_version_check_command,
     build_location_check_command,
+    build_close_session_command,
     build_data_frame
 };
 use crate::utils::{hash_ip, CLIENT_REQUEST_TIMEOUT};
@@ -15,7 +16,7 @@ use dashmap::DashMap;
 use std::error::Error;
 use log::{trace, debug, info, warn, error};
 use tokio::{io::{AsyncWriteExt, AsyncReadExt}, net::{TcpListener, TcpStream}};
-use tokio::time::{self, Duration, Instant, timeout};
+use tokio::time::{Duration, Instant, timeout};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, Semaphore};
 use bytes::{BytesMut, Bytes, Buf};
@@ -37,7 +38,7 @@ pub struct Slave {
 
 impl Slave {
     pub fn new(ip_addr: String, stream: TcpStream) -> (Self, mpsc::Receiver<(u32, Bytes)>) {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(500);
         let slave = Self {
             ip_addr,
             version: None,
@@ -147,6 +148,8 @@ impl ProxyManager {
             if let Err(e) = client.to_client_tx.send(payload).await {
                 error!("Failed to send data to client {}: {}", session_id, e);
             }
+        } else {
+            trace!("No client found with session ID {}. Dropping data.", session_id);
         }
     }
 
@@ -200,7 +203,7 @@ pub async fn handle_slave_io(
                     // Process the packet with the current_packet_type and current_command_type
                     let payload = buffer.split_to(payload_len).freeze();
 
-                    debug!("Processing packet from slave: {} | PacketType: {:?} | CommandType: {:?}", 
+                    trace!("Processing packet from slave: {} | PacketType: {:?} | CommandType: {:?}", 
                           slave.ip_addr, current_packet_type, current_command_type);
 
                     if let Err(_err) = process_packet(
@@ -225,7 +228,18 @@ pub async fn handle_slave_io(
 
             // Handle traffic from clients
             Some((client_session_id, client_data)) = cli_rx.recv() => {
-                trace!("Master -> Slave: sid {}, size: {} bytes", client_session_id, client_data.len());
+                if client_data.is_empty() {
+                    // Null data received, build and send CloseSession command
+                    trace!("Received session termination signal for session {}", client_session_id);
+                    let close_session_command = build_close_session_command(client_session_id);
+                    if let Err(e) = slave.write_stream(&close_session_command).await {
+                        error!("Failed to send CloseSession command to slave {}: {}", slave.ip_addr, e);
+                        break;
+                    }
+                    continue;
+                }
+
+                debug!("sid {}, {} bytes: forwarded to SLAVE", client_session_id, client_data.len());
                 let frame = build_data_frame(client_session_id, &client_data);
                 if let Err(e) = slave.write_stream(&frame).await {
                     error!("Failed to write to slave {}: {}", slave.ip_addr, e);
@@ -306,11 +320,11 @@ pub async fn handle_client_io(
                 match client_read {
                     Ok(Ok(len)) => {
                         if len == 0 {
-                            debug!("Client {} closed connection", session_id);
+                            trace!("Client {} closed connection", session_id);
                             break;
                         }
 
-                        trace!("Client -> Master: sid {}, size: {} bytes", session_id, len);
+                        debug!("sid {}, {} bytes: CLIENT sent", session_id, len);
 
                         let data = buffer.split().freeze();
                         if slave_tx.send((session_id, data)).await.is_err() {
@@ -331,7 +345,7 @@ pub async fn handle_client_io(
 
             // Handle traffic from the slave to the client
             Some(payload) = client_rx.recv() => {
-                trace!("Master -> Client: sid {}, size: {} bytes", session_id, payload.len());
+                debug!("sid {}, {} bytes: MASTER replied", session_id, payload.len());
                 if let Err(e) = cli_stream.write_all(&payload).await {
                     error!("Failed to send data to client {}: {}", session_id, e);
                     break;
@@ -345,6 +359,11 @@ pub async fn handle_client_io(
 
         buffer_pool.return_buffer(shard_id, buffer).await;
         drop(permit);
+    }
+
+    // Inform Slave to delete this session
+    if slave_tx.send((session_id, Bytes::new())).await.is_err() {
+        error!("Failed to notify slave about session {} closure", session_id);
     }
 
     // Cleanup after the session ends
@@ -368,7 +387,7 @@ pub async fn handle_slave_connections(
         let (slave_stream, slave_addr) = match slave_listener.accept().await {
             Err(e) => {
                 error!("Error accepting connection: {}", e);
-                return Err(Box::new(e)); // Return the error instead of Ok
+                return Err(Box::new(e));
             }
             Ok(p) => p,
         };
@@ -376,7 +395,15 @@ pub async fn handle_slave_connections(
         trace!("New Slave attempting to connect: {}:{}", slave_addr.ip(), slave_addr.port());
 
         // Create a new Slave object
-        let (new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
+        let (mut new_slave, slave_rx) = Slave::new(slave_addr.ip().to_string(), slave_stream);
+
+        if let Err(e) = verify_slave_session(&mut new_slave, &allowed_locations).await {
+            debug!("Slave {} validation failed: {}", new_slave.ip_addr, e);
+            continue;
+        }
+
+        proxy_manager.slaves.insert(new_slave.ip_addr.clone(), new_slave.clone());
+        info!("Slave {} successfully registered.", new_slave.ip_addr);
 
         // Spawn a task to handle the slave's I/O operations
         let proxy_manager_clone = Arc::clone(&proxy_manager);
@@ -384,17 +411,7 @@ pub async fn handle_slave_connections(
         let metrics_clone = Arc::clone(&metrics);
 
         tokio::spawn({
-            let allowed_locations = allowed_locations.clone();
-            let mut new_slave = new_slave.clone();
-        
             async move {
-                if let Err(e) = verify_slave_session(&mut new_slave, &allowed_locations).await {
-                    warn!("Slave {} validation failed: {}", new_slave.ip_addr, e);
-                    return;
-                }
-        
-                proxy_manager_clone.slaves.insert(new_slave.ip_addr.clone(), new_slave.clone());
-        
                 // Call the slave IO handler for the new slave
                 let result = handle_slave_io(
                     new_slave,
@@ -434,11 +451,10 @@ async fn verify_slave_session(
         return Err(format!("Slave {} has unsupported version: {}", temp_slave.ip_addr, version).into());
     }
     temp_slave.set_version(version.clone());
-    debug!("Slave {} version check passed: {}", temp_slave.ip_addr, version);
+    trace!("Slave {} version check passed: {}", temp_slave.ip_addr, version);
 
     // Step 2: (Optional) Perform Geolocation Check
     if !allowed_locations.is_empty() {
-        debug!("Performing location check for slave {}", temp_slave.ip_addr);
         let location_command = build_location_check_command(&temp_slave.ip_addr);
         temp_slave.write_stream(&location_command).await?;
         buffer.clear();
@@ -451,7 +467,7 @@ async fn verify_slave_session(
 
         buffer.advance(10);
         let location_data = String::from_utf8(buffer.split_to(payload_len).to_vec())?;
-        debug!("Received location data: {}", location_data);
+        trace!("Received location data: {}", location_data);
 
         // Parse the location response
         let location: serde_json::Value = serde_json::from_str(&location_data)?;
@@ -463,14 +479,13 @@ async fn verify_slave_session(
                 )
                 .into());
             }
-            debug!("Slave {} location check passed: {}", temp_slave.ip_addr, country);
+            trace!("Slave {} location check passed: {}", temp_slave.ip_addr, country);
         } else {
             return Err("Failed to parse location response".into());
         }
     }
 
     // Step 3: Perform Speed Test
-    debug!("Performing speed test for slave {}", temp_slave.ip_addr);
     let speed_test_command = build_speed_test_command("https://speed.cloudflare.com/__down?bytes=5000000");
     temp_slave.write_stream(&speed_test_command).await?;
     buffer.clear();
@@ -485,7 +500,7 @@ async fn verify_slave_session(
     let speed_str = String::from_utf8(buffer.split_to(payload_len).to_vec())?;
     let speed = speed_str.parse::<f64>()?;
     temp_slave.set_speed(speed);
-    debug!("Slave {} speed test passed: {:.2} Mbps", temp_slave.ip_addr, speed);
+    trace!("Slave {} speed test passed: {:.2} Mbps", temp_slave.ip_addr, speed);
 
     Ok(())
 }

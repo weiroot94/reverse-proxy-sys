@@ -1,13 +1,13 @@
 use bytes::BytesMut;
-use log::{trace, debug};
+use log::debug;
 use std::{
     collections::VecDeque,
     sync::Arc,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
-pub const MAX_BUF_SIZE: usize = 8192;
-pub const POOL_SIZE: usize = 50;
+pub const MAX_BUF_SIZE: usize = 128 * 1024;
+pub const POOL_SIZE: usize = 200;
 
 // Sharded Buffer Pool for high concurrency
 #[derive(Clone)]
@@ -53,14 +53,12 @@ impl BufferPoolShard {
         let mut buffers = self.buffers.lock().await;
         if let Some(mut buffer) = buffers.pop_front() {
             if buffer.capacity() < MAX_BUF_SIZE {
-                trace!("Discarding undersized buffer, creating new one");
                 buffer = BytesMut::with_capacity(MAX_BUF_SIZE);
             } else {
                 buffer.clear(); // Prepare buffer for reuse
             }
             buffer
         } else {
-            trace!("No available buffer, creating new one");
             BytesMut::with_capacity(MAX_BUF_SIZE)
         }
     }

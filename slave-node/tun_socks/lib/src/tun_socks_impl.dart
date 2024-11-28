@@ -18,6 +18,7 @@ const int speedCheck = 0x01;
 const int versionCheck = 0x02;
 const int heartbeatCheck = 0x03;
 const int locationCheck = 0x04;
+const int closeSession = 0x05;
 
 class ProtocolPacket {
   final int sessionId;
@@ -102,7 +103,7 @@ class TunSocks {
               session.processSocks5Data(packet.payload);
 
             } else if (packet.packetType == commandPacket) {
-              await _handleCommand(packet.commandId, packet.payload);
+              await _handleCommand(packet.sessionId, packet.commandId, packet.payload);
             }
           },
           onDone: () {
@@ -119,7 +120,7 @@ class TunSocks {
     }
   }
 
-  Future<void> _handleCommand(int? commandId, List<int> payload) async {
+  Future<void> _handleCommand(int sessionId, int? commandId, List<int> payload) async {
     switch (commandId) {
       case speedCheck:
         await _performSpeedTest(payload);
@@ -137,14 +138,21 @@ class TunSocks {
         print('location check command received');
         await _performLocationCheck(payload);
         break;
+      case closeSession:
+        print('close_session command received session $sessionId');
+        _handleCloseSession(sessionId);
+        break;
       default:
         print('Unknown command received');
     }
   }
 
   void _handleDisconnection() {
+    if (_masterConn != null) {
+      _cleanupConnections();
+    }
+
     currentState = ProxyState.disconnected;
-    _cleanupConnections();
 
     if (!isManuallyStopped) {
       _retryConnection();
@@ -212,6 +220,14 @@ class TunSocks {
     }
   }
 
+  void _handleCloseSession(int sessionId) {
+    if (sessions.containsKey(sessionId)) {
+      sessions[sessionId]?.closeSession();
+    } else {
+      print('Session ID $sessionId not found');
+    }
+  }
+
   int _bytesToInt(List<int> bytes) {
     return bytes.fold(0, (previousValue, element) => (previousValue << 8) + element);
   }
@@ -239,7 +255,6 @@ class TunSocks {
         ...payload                       // Payload data
       ];
       try {
-        print('Sending data to master: ${packet.length}');
         _masterConn?.add(packet);
         await _masterConn?.flush();
       } catch (e) {
@@ -283,8 +298,14 @@ class TunSocks {
 
   void _cleanupConnections() {
     _masterConnLock.synchronized(() async {
-      await _masterConn?.close();
-      _masterConn = null;
+      if (_masterConn != null) {
+        try {
+          await _masterConn?.close();
+        } catch (e) {
+          print('Error while closing master connection: $e');
+        }
+        _masterConn = null;
+      }
     });
     currentState = ProxyState.disconnected;
   }
