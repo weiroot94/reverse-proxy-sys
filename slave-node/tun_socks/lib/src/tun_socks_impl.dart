@@ -61,7 +61,7 @@ class TunSocks {
   final String host;
   final int port;
 
-  Socket? _masterConn;
+  late Socket? _masterConn;
   final _masterConnLock = Lock();
   ProxyState currentState = ProxyState.disconnected;
   int retryAttempts = 0;
@@ -125,13 +125,16 @@ class TunSocks {
         await _performSpeedTest(payload);
         break;
       case versionCheck:
+        print('version check command received');
         _sendVersionInfo();
         break;
       case heartbeatCheck:
+        print('heartbeat command received');
         _sendAliveResponse();
-        _manageHeartbeatTimer();
+        //_manageHeartbeatTimer();
         break;
       case locationCheck:
+        print('location check command received');
         await _performLocationCheck(payload);
         break;
       default:
@@ -224,20 +227,23 @@ class TunSocks {
 
   void _sendToMasterInProtocol(int sessionId, List<int> payload, {int packetType = dataPacket, int commandId = 0x00}) async {
     await _masterConnLock.synchronized(() async {
-      if (_masterConn != null) {
-        final packet = [
-          packetType,                      // Packet Type (0x00 for data, 0x01 for command)
-          ..._intToBytes(sessionId),       // Session ID
-          commandId,                       // Command ID (default to 0x00 for data packets)
-          ..._intToBytes(payload.length),  // Payload Length
-          ...payload                       // Payload data
-        ];
-        try {
-          _masterConn?.add(packet);
-          await _masterConn?.flush();
-        } catch (e) {
-          print('Failed to send to master: $e');
-        }
+      if (_masterConn == null || currentState != ProxyState.connected) {
+        print('Attempted to send data, but connection is not active.');
+        return;
+      }
+      final packet = [
+        packetType,                      // Packet Type (0x00 for data, 0x01 for command)
+        ..._intToBytes(sessionId),       // Session ID
+        commandId,                       // Command ID (default to 0x00 for data packets)
+        ..._intToBytes(payload.length),  // Payload Length
+        ...payload                       // Payload data
+      ];
+      try {
+        print('Sending data to master: ${packet.length}');
+        _masterConn?.add(packet);
+        await _masterConn?.flush();
+      } catch (e) {
+        print('Failed to send to master: $e');
       }
     });
   }
@@ -254,8 +260,10 @@ class TunSocks {
   }
 
   void _sendVersionInfo() {
+    print('sending version $slaveVersion');
     final payload = utf8.encode(slaveVersion);
     _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: versionCheck);
+    print('sent versionfino to master');
   }
 
   void _sendAliveResponse() {
