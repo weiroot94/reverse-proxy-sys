@@ -99,6 +99,15 @@ pub struct ProxyManager {
 }
 
 impl ProxyManager {
+    pub fn new(client_assign_mode: u8) -> Self {
+        ProxyManager {
+            client_assign_mode,
+            slaves: Arc::new(DashMap::new()),
+            clients: Arc::new(DashMap::new()),
+            cli_ip_to_slave: Arc::new(DashMap::new()),
+        }
+    }
+
     // Get tx of avaiable Slave using weighted round-robin
     pub async fn get_available_slave_tx(&self, client_ip: &String) -> Option<mpsc::Sender<(u32, Bytes)>> {
         // Mode 1: Assign the same slave to clients from the same IP
