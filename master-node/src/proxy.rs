@@ -333,7 +333,7 @@ pub async fn handle_client_io(
                         }
                     }
                     Ok(Err(e)) => {
-                        error!("Error reading from client session id {}: {}", session_id, e);
+                        trace!("Error reading from client session id {}: {}", session_id, e);
                         break;
                     }
                     Err(_) => {
@@ -347,11 +347,11 @@ pub async fn handle_client_io(
             Some(payload) = client_rx.recv() => {
                 debug!("sid {}, {} bytes: MASTER replied", session_id, payload.len());
                 if let Err(e) = cli_stream.write_all(&payload).await {
-                    error!("Failed to send data to client {}: {}", session_id, e);
+                    error!("Failed to send data to client session id {}: {}", session_id, e);
                     break;
                 }
                 if let Err(e) = cli_stream.flush().await {
-                    error!("Failed to flush stream for client {}: {}", session_id, e);
+                    error!("Failed to flush stream for client session id {}: {}", session_id, e);
                     break;
                 }
             }

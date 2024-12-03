@@ -25,12 +25,15 @@ use tokio::{
     sync::{Semaphore, Mutex as AsyncMutex, mpsc},
     io,
 };
+use console_subscriber;
 
 const POOL_SIZE: usize = 50;
 const NUM_SHARDS: usize = 8;
 
 #[tokio::main]
 async fn main() -> io::Result<()>  {
+    console_subscriber::init();
+
     let args: Vec<String> = std::env::args().collect();
     let program = args[0].clone();
 
