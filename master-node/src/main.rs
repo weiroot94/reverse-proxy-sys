@@ -30,7 +30,7 @@ use console_subscriber;
 const POOL_SIZE: usize = 50;
 const NUM_SHARDS: usize = 8;
 
-#[tokio::main]
+#[tokio::main(worker_threads = 4)]
 async fn main() -> io::Result<()>  {
     console_subscriber::init();
 
