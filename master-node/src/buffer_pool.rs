@@ -6,7 +6,7 @@ use std::{
 };
 use tokio::sync::Mutex as AsyncMutex;
 
-pub const MAX_BUF_SIZE: usize = 128 * 1024;
+pub const MAX_BUF_SIZE: usize = 8192;
 pub const POOL_SIZE: usize = 200;
 
 // Sharded Buffer Pool for high concurrency
