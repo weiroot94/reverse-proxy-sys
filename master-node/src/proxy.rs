@@ -146,7 +146,7 @@ impl ProxyManager {
     pub async fn route_to_client(&self, session_id: u32, payload: Bytes) {
         if let Some(client) = self.clients.get(&session_id) {
             if let Err(e) = client.to_client_tx.send(payload).await {
-                error!("Failed to send data to client {}: {}", session_id, e);
+                error!("Failed to send to client mpsc channel: session id: {}: {}", session_id, e);
             }
         } else {
             trace!("No client found with session ID {}. Dropping data.", session_id);
