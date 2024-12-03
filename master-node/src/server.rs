@@ -78,6 +78,12 @@ pub async fn start_client_listener(
             }
         };
 
+        // Set TCP_NODELAY
+        if let Err(e) = client_stream.set_nodelay(true) {
+            log::error!("Failed to set TCP_NODELAY on client socket: {}", e);
+            continue;
+        }
+
         // Retrieve an available slave stream
         let client_ip = client_addr.ip().to_string();
         if let Some(slave_tx) = proxy_manager.get_available_slave_tx(&client_ip).await {
@@ -119,6 +125,12 @@ pub async fn handle_slave_connections(
             }
             Ok(p) => p,
         };
+
+        // Set TCP_NODELAY
+        if let Err(e) = slave_stream.set_nodelay(true) {
+            log::error!("Failed to set TCP_NODELAY on slave socket: {}", e);
+            continue;
+        }
 
         trace!("New Slave attempting to connect: {}:{}", slave_addr.ip(), slave_addr.port());
 
