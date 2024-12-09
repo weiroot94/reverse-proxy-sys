@@ -3,6 +3,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::time;
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 use bytes::{BytesMut, Buf};
 use std::error::Error;
 use log::{trace, debug, info, error};
@@ -23,7 +24,7 @@ const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.7"];
 
 pub async fn start_slave_listener(
     master_addr: &str,
-    proxy_manager: Arc<ProxyManager>,
+    proxy_manager: Arc<AsyncMutex<ProxyManager>>,
     slave_buffer_pool: Arc<ShardedBufferPool>,
     metrics: Arc<Metrics>,
     allowed_locations: Arc<Vec<String>>
@@ -57,7 +58,7 @@ pub async fn start_slave_listener(
 
 pub async fn start_client_listener(
     socks_addr: &str,
-    proxy_manager: Arc<ProxyManager>,
+    proxy_manager: Arc<AsyncMutex<ProxyManager>>,
     semaphore: Arc<Semaphore>,
     client_buffer_pool: Arc<ShardedBufferPool>
 ) {
@@ -86,7 +87,7 @@ pub async fn start_client_listener(
 
         // Retrieve an available slave stream
         let client_ip = client_addr.ip().to_string();
-        if let Some(slave_tx) = proxy_manager.get_available_slave_tx(&client_ip).await {
+        if let Some(slave_tx) = proxy_manager.lock().await.get_available_slave_tx(&client_ip).await {
             let client_stream = Arc::new(tokio::sync::Mutex::new(client_stream));
             let session_id = rand::random::<u32>();
 
@@ -112,7 +113,7 @@ pub async fn start_client_listener(
 
 pub async fn handle_slave_connections(
     slave_listener: TcpListener,
-    proxy_manager: Arc<ProxyManager>,
+    proxy_manager: Arc<AsyncMutex<ProxyManager>>,
     buffer_pool: Arc<ShardedBufferPool>,
     metrics: Arc<Metrics>,
     allowed_locations: Arc<Vec<String>>,
@@ -152,7 +153,7 @@ pub async fn handle_slave_connections(
                     debug!("Slave {} validation passed.", slave.ip_addr);
 
                     // Add the validated slave to the proxy manager
-                    proxy_manager_clone.slaves.insert(slave.ip_addr.clone(), slave.clone());
+                    proxy_manager_clone.lock().await.add_slave(slave.clone()).await;
                     info!("Slave {} successfully registered.", new_slave.ip_addr);
 
                     // Spawn a task to handle I/O for the validated slave

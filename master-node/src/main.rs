@@ -6,6 +6,7 @@ mod buffer_pool;
 mod metrics;
 mod utils;
 mod packet;
+mod load_balancing;
 
 use conf::parse_args;
 use logger::init_logging;
@@ -13,13 +14,19 @@ use server::{start_slave_listener, start_client_listener};
 use std::sync::Arc;
 use prometheus::Registry;
 use tokio::sync::Semaphore;
+use tokio::sync::Mutex as AsyncMutex;
 use log::info;
 use crate::metrics::{start_metrics_server, Metrics};
 use crate::proxy::ProxyManager;
 use crate::buffer_pool::ShardedBufferPool;
 
+#[cfg(all(not(target_os = "windows"), feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
+#[cfg(any(target_os = "windows", not(feature = "jemalloc")))]
+#[global_allocator]
+static GLOBAL: std::alloc::System = std::alloc::System;
 
 const MAX_CONCURRENT_REQUESTS: usize = 30;
 const POOL_SIZE: usize = 50;
@@ -39,7 +46,7 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(start_metrics_server(Arc::new(registry)));
 
     // Proxy manager and buffer pool
-    let proxy_manager = Arc::new(ProxyManager::new(config.proxy_mode));
+    let proxy_manager = Arc::new(AsyncMutex::new(ProxyManager::new(config.proxy_mode)));
     let slave_buffer_pool = Arc::new(ShardedBufferPool::new(NUM_SHARDS, POOL_SIZE));
     let client_buffer_pool = Arc::new(ShardedBufferPool::new(NUM_SHARDS, POOL_SIZE));
 

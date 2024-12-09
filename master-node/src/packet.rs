@@ -3,6 +3,7 @@ use crate::utils::bytes_to_u32;
 
 use log::{debug, error};
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
 use bytes::{BytesMut, Bytes, BufMut};
 
@@ -118,7 +119,7 @@ pub async fn process_packet(
     payload: Bytes,
     session_id: u32,
     slave: &Slave,
-    proxy_manager: &Arc<ProxyManager>,
+    proxy_manager: &Arc<AsyncMutex<ProxyManager>>,
     last_seen: &mut Instant,
 ) -> Result<(), std::io::Error> {
     match packet_type {
@@ -139,7 +140,7 @@ pub async fn process_packet(
         }
         Some(PacketType::Data) => {
             debug!("sid {}, {} bytes : SLAVE replied", session_id, payload.len());
-            proxy_manager.route_to_client(session_id, payload).await;
+            proxy_manager.lock().await.route_to_client(session_id, payload).await;
         }
         None => {
             error!("Unknown PacketType received from slave: {}", slave.ip_addr);
