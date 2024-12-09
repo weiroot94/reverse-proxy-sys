@@ -35,6 +35,7 @@ pub struct Slave {
     pub ip_addr: String,
     pub id_token: u8,
     pub version: Option<String>,
+    pub location: Option<String>,
     // Weight for round robin
     net_speed: f64,
     stream: Arc<AsyncMutex<TcpStream>>,
@@ -49,6 +50,7 @@ impl Slave {
             ip_addr,
             id_token: 0,
             version: None,
+            location: None,
             net_speed: 0.0,
             stream: Arc::new(AsyncMutex::new(stream)),
             tx,
@@ -72,6 +74,10 @@ impl Slave {
 
     pub fn set_version(&mut self, version: String) {
         self.version = Some(version);
+    }
+
+    pub fn set_location(&mut self, location: String) {
+        self.location = Some(location);
     }
 
     pub fn set_speed(&mut self, speed: f64) {

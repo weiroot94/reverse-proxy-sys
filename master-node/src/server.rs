@@ -203,29 +203,32 @@ async fn verify_slave_session(
     temp_slave.set_version(version.clone());
     trace!("Slave {} version check passed: {}", temp_slave.ip_addr, version);
 
-    // Step 2: (Optional) Perform Geolocation Check
-    if !allowed_locations.is_empty() {
-        let location_command = build_location_check_command(&temp_slave.ip_addr);
-        temp_slave.write_stream(&location_command).await?;
-        buffer.clear();
+    // Step 2: Perform Geolocation Check
+    let location_command = build_location_check_command(&temp_slave.ip_addr);
+    temp_slave.write_stream(&location_command).await?;
+    buffer.clear();
 
-        if let Err(_) = time::timeout(CLIENT_REQUEST_TIMEOUT, temp_slave.read_stream(&mut buffer)).await {
-            return Err("Location check response timed out".into());
-        }
-        
-        let (_, _, payload_len, _) = parse_header(&buffer);
+    if let Err(_) = time::timeout(CLIENT_REQUEST_TIMEOUT, temp_slave.read_stream(&mut buffer)).await {
+        return Err("Location check response timed out".into());
+    }
+    
+    let (_, _, payload_len, _) = parse_header(&buffer);
 
-        if payload_len == 0 || buffer.len() < 10 + payload_len {
-            return Err("Location check response is empty".into());
-        }
+    if payload_len == 0 || buffer.len() < 10 + payload_len {
+        return Err("Location check response is empty".into());
+    }
 
-        buffer.advance(10);
-        let location_data = String::from_utf8(buffer.split_to(payload_len).to_vec())?;
-        trace!("Received location data: {}", location_data);
+    buffer.advance(10);
+    let location_data = String::from_utf8(buffer.split_to(payload_len).to_vec())?;
+    trace!("Received location data: {}", location_data);
 
-        // Parse the location response
-        let location: serde_json::Value = serde_json::from_str(&location_data)?;
-        if let Some(country) = location["data"]["country"].as_str() {
+    // Parse the location response
+    let location: serde_json::Value = serde_json::from_str(&location_data)?;
+    if let Some(country) = location["data"]["country"].as_str() {
+        temp_slave.set_location(country.to_string());
+
+        // If allowed_locations is not empty, validate the country
+        if !allowed_locations.is_empty() {
             if !allowed_locations.iter().any(|loc| loc.eq_ignore_ascii_case(country)) {
                 return Err(format!(
                     "Slave {} is in a restricted location: {}",
@@ -234,9 +237,9 @@ async fn verify_slave_session(
                 .into());
             }
             trace!("Slave {} location check passed: {}", temp_slave.ip_addr, country);
-        } else {
-            return Err("Failed to parse location response".into());
         }
+    } else {
+        return Err("Failed to parse location response".into());
     }
 
     // Step 3: Perform Speed Test
