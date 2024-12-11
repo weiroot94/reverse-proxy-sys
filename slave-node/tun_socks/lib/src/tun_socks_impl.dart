@@ -62,7 +62,7 @@ class TunSocks {
   final String host;
   final int port;
 
-  late Socket? _masterConn;
+  Socket? _masterConn;
   final _masterConnLock = Lock();
   ProxyState currentState = ProxyState.disconnected;
   int retryAttempts = 0;
@@ -144,7 +144,7 @@ class TunSocks {
         _handleInitSession(sessionId, payload);
         break;
       default:
-        print('Unknown command received');
+        print('Unknown command received: Command ID $commandId with session ID $sessionId');
     }
   }
 
@@ -170,15 +170,14 @@ class TunSocks {
     }
 
     final session = Socks5Session(sessionId, _masterConn, _sendDataPacket);
-    await session.initialize(address, port);
-
     sessions[sessionId] = session;
+    await session.initialize(address, port);
   }
 
   void _handleDisconnection() {
-    if (_masterConn != null) {
-      _cleanupConnections();
-    }
+    if (currentState == ProxyState.disconnected) return;
+
+    _cleanupConnections();
 
     currentState = ProxyState.disconnected;
 
@@ -323,8 +322,9 @@ class TunSocks {
           await _masterConn?.close();
         } catch (e) {
           print('Error while closing master connection: $e');
+        } finally {
+          _masterConn = null;
         }
-        _masterConn = null;
       }
     });
     currentState = ProxyState.disconnected;
