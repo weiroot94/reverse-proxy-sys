@@ -323,6 +323,7 @@ pub async fn handle_slave_io(
     buffer_pool.return_buffer(shard_id, buffer).await;
 
     // Handle disconnection
+    info!("Slave {} disconnected", slave.ip_addr);
     proxy_manager.lock().await.remove_slave(&slave.id_token).await;
 
     metrics.slave_active_connections.dec();
