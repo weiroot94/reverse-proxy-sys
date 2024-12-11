@@ -4,9 +4,10 @@ use crate::packet::{
     parse_header,
     process_packet,
     build_heartbeat_command,
-    build_close_session_command,
+    build_init_session_command,
     build_data_frame
 };
+use crate::socks5::handle_client_handshake;
 use crate::load_balancing::{
     Balancer,
     BalanceCtx,
@@ -18,7 +19,7 @@ use crate::utils::{
 };
 
 use dashmap::DashMap;
-use log::{trace, debug, warn, error};
+use log::{debug, error, info, trace, warn};
 use tokio::{io::{AsyncWriteExt, AsyncReadExt}, net::TcpStream};
 use tokio::time::{Duration, Instant, timeout};
 use std::sync::Arc;
@@ -40,12 +41,12 @@ pub struct Slave {
     net_speed: f64,
     stream: Arc<AsyncMutex<TcpStream>>,
     // Sender to receive data from clients
-    tx: mpsc::Sender<(u32, Bytes)>,
+    tx: mpsc::Sender<Bytes>,
 }
 
 impl Slave {
-    pub fn new(ip_addr: String, stream: TcpStream) -> (Self, mpsc::Receiver<(u32, Bytes)>) {
-        let (tx, rx) = mpsc::channel(500);
+    pub fn new(ip_addr: String, stream: TcpStream) -> (Self, mpsc::Receiver<Bytes>) {
+        let (tx, rx) = mpsc::channel::<Bytes>(500);
         let slave = Self {
             ip_addr,
             id_token: 0,
@@ -155,11 +156,39 @@ impl ProxyManager {
     }
 
     // Get tx of avaiable Slave using weighted round-robin
-    pub async fn get_available_slave_tx(&self, client_ip: &String) -> Option<mpsc::Sender<(u32, Bytes)>> {
+    pub async fn get_available_slave_tx(
+        &self,
+        client_ip: &String,
+        requested_location: Option<&String>
+    ) -> Option<mpsc::Sender<Bytes>> {
         match IpAddr::from_str(client_ip) {
             Ok(parsed_ip) => {
                 if let Some(token) = self.balancer.lock().await.next(BalanceCtx { src_ip: &parsed_ip }) {
-                    return self.slaves.get(&token.0.to_string()).map(|slave| slave.tx.clone());
+                    if let Some(slave) = self.slaves.get(&token.0.to_string()) {
+                        // If restricted location is empty, ignore location filtering
+                        if let Some(requested_location) = requested_location {
+                            if let Some(slave_location) = &slave.location {
+                                // Check if the slave matches the requested location
+                                if slave_location.eq_ignore_ascii_case(requested_location) {
+                                    return Some(slave.tx.clone());
+                                } else {
+                                    trace!(
+                                        "Slave {} does not match requested location {}",
+                                        token.0,
+                                        requested_location
+                                    );
+                                }
+                            } else {
+                                trace!(
+                                    "Slave {} has no location data, skipping location match",
+                                    token.0
+                                );
+                            }
+                        } else {
+                            // No location requested, return the slave
+                            return Some(slave.tx.clone());
+                        }
+                    }
                 }
             }
             Err(_) => {
@@ -184,7 +213,7 @@ impl ProxyManager {
 // Function to handle a single slave's I/O operations for all clients using it (multiplexing)
 pub async fn handle_slave_io(
     slave: Slave,
-    mut cli_rx: mpsc::Receiver<(u32, Bytes)>,
+    mut cli_rx: mpsc::Receiver<Bytes>,
     proxy_manager: Arc<AsyncMutex<ProxyManager>>,
     buffer_pool: Arc<ShardedBufferPool>,
     metrics: Arc<Metrics>,
@@ -249,21 +278,8 @@ pub async fn handle_slave_io(
             }
 
             // Handle traffic from clients
-            Some((client_session_id, client_data)) = cli_rx.recv() => {
-                if client_data.is_empty() {
-                    // Null data received, build and send CloseSession command
-                    trace!("Received session termination signal for session {}", client_session_id);
-                    let close_session_command = build_close_session_command(client_session_id);
-                    if let Err(e) = slave.write_stream(&close_session_command).await {
-                        error!("Failed to send CloseSession command to slave {}: {}", slave.ip_addr, e);
-                        break;
-                    }
-                    continue;
-                }
-
-                debug!("sid {}, {} bytes: forwarded to SLAVE", client_session_id, client_data.len());
-                let frame = build_data_frame(client_session_id, &client_data);
-                if let Err(e) = slave.write_stream(&frame).await {
+            Some(payload) = cli_rx.recv() => {
+                if let Err(e) = slave.write_stream(&payload).await {
                     error!("Failed to write to slave {}: {}", slave.ip_addr, e);
                     break;
                 }
@@ -319,16 +335,60 @@ pub async fn handle_slave_io(
 pub async fn handle_client_io(
     session_id: u32,
     client: Client,
-    slave_tx: mpsc::Sender<(u32, Bytes)>,
     mut client_rx: mpsc::Receiver<Bytes>,
     proxy_manager: Arc<AsyncMutex<ProxyManager>>,
     semaphore: Arc<Semaphore>,
     buffer_pool: Arc<ShardedBufferPool>,
 ) -> Result<(), std::io::Error> {
+    let mut cli_stream = client.stream.lock().await;
+
+    // Process SOCKS5 handshake and extract username, destination information
+    let (username, dest_address, dest_port) = match handle_client_handshake(&mut cli_stream).await {
+        Ok(result) => result,
+        Err(e) => {
+            error!(
+                "Error during SOCKS5 handshake for session {}: {}",
+                session_id, e
+            );
+            return Err(e); // Exit if handshake fails
+        }
+    };
+
+    let slave_tx = proxy_manager.lock().await
+        .get_available_slave_tx(&cli_stream.local_addr()?.ip().to_string(), username.as_ref())
+        .await;
+
+    let slave_tx = match slave_tx {
+        Some(tx) => tx,
+        None => {
+            error!(
+                "No suitable slave found for session {} (username: {:?})",
+                session_id, username
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No suitable slave found",
+            ));
+        }
+    };
+
+    // Step 3: Forward destination info to the slave
+    let dest_info = format!("{}:{}", dest_address, dest_port);
+    let init_session_packet = build_init_session_command(session_id, &dest_info);
+    if timeout(CLIENT_REQUEST_TIMEOUT, slave_tx.send(init_session_packet))
+        .await
+        .is_err()
+    {
+        warn!("Failed to send data to slave for session {}", session_id);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "Failed to send to slave tx",
+        ));
+    }
+
     // Add client session
     proxy_manager.lock().await.clients.insert(session_id, client.clone());
 
-    let mut cli_stream = client.stream.lock().await;
     let shard_id = session_id as usize;
 
     // Main loop to handle continuous traffic between client and slave
@@ -345,10 +405,12 @@ pub async fn handle_client_io(
                             break;
                         }
 
-                        debug!("sid {}, {} bytes: CLIENT sent", session_id, len);
+                        debug!("sid {}, {} bytes: CLIENT -> SLAVE", session_id, len);
 
                         let data = buffer.split().freeze();
-                        if slave_tx.send((session_id, data)).await.is_err() {
+                        let data_packet = build_data_frame(session_id, &data);
+
+                        if slave_tx.send(data_packet).await.is_err() {
                             warn!("Failed to send data to slave for session {}", session_id);
                             break;
                         }
@@ -380,11 +442,6 @@ pub async fn handle_client_io(
 
         buffer_pool.return_buffer(shard_id, buffer).await;
         drop(permit);
-    }
-
-    // Inform Slave to delete this session
-    if slave_tx.send((session_id, Bytes::new())).await.is_err() {
-        error!("Failed to notify slave about session {} closure", session_id);
     }
 
     // Cleanup after the session ends

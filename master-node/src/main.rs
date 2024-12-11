@@ -7,6 +7,7 @@ mod metrics;
 mod utils;
 mod packet;
 mod load_balancing;
+mod socks5;
 
 use conf::parse_args;
 use logger::init_logging;

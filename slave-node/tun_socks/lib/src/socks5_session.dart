@@ -3,10 +3,7 @@ import 'package:synchronized/synchronized.dart';
 import 'dart:typed_data';
 import 'dart:convert';
 import 'dart:async';
-
-// Enum for address types
-enum Addr { v4, v6, domain }
-enum States { handshake, handling, proxying }
+import 'dart:collection';
 
 // SOCKS5 session list
 Map<int, Socks5Session> sessions = {};
@@ -17,94 +14,42 @@ class Socks5Session {
   final Socket? _masterConn;
   Socket? _destConn;
   final Lock _destConnLock = Lock();
-  States currentState = States.handshake;
   final Function(int, List<int>) _sendDataToMaster;
+  // Completer to signal readiness
+  final Completer<void> _connectionReady = Completer<void>();
+  // Packet queue for initial processing
+  final Queue<List<int>> _packetQueue = Queue();
 
   Socks5Session(this.sessionId, this._masterConn, this._sendDataToMaster);
 
-  Future<void> processSocks5Data(List<int> data) async {
+  /// Initialize the session and connect to the destination
+  Future<void> initialize(String destAddress, int destPort) async {
     try {
-        switch (currentState) {
-          case States.handshake:
-            if (data.length < 2) {
-              _onSessionError('Invalid handshake data length');
-              return;
-            }
+      _destConn = await Socket.connect(destAddress, destPort, timeout: Duration(seconds: 10));
 
-            if (data[0] != 5) {
-              _onSessionError('Unsupported SOCKS version');
-              return;
-            }
+      _destConn?.listen(
+        (data) => _sendToClient(data),
+        onDone: _onSessionClosed,
+        onError: (error) => _onSessionError('Destination connection error: $error'),
+      );
 
-            await _sendToClient(Uint8List.fromList([5, 0])); // No authentication required
-            currentState = States.handling;
-            break;
+      _connectionReady.complete();
+      _processQueuedPackets();
+    } catch (e) {
+      _onSessionError('Failed to connect to $destAddress:$destPort: $e');
+    }
+  }
 
-          case States.handling:
-            if (data.length < 4) {
-              _onSessionError('Invalid handling data length');
-              return;
-            }
+  Future<void> processSocks5Data(List<int> data) async {
+    if (!_connectionReady.isCompleted) {
+      // Queue data until initialization is ready
+      print('Session $sessionId not initialized yet. Buffering packet.');
+      _packetQueue.add(data);
+      return;
+    }
 
-            if (data[0] != 5) {
-              _onSessionError('Invalid handling SOCKS version');
-              return;
-            }
-
-            if (data[1] != 1) {
-              _onSessionError('Unsupported command (not CONNECT)');
-              return;
-            }
-
-            // Secondary byte is reserved one
-            final addrType = data[3];
-
-            String address;
-            int port;
-
-            switch (addrType) {
-              case 0x01: // IPv4
-                address = data.sublist(4, 8).join('.');
-                port = (data[8] << 8) | data[9];
-                break;
-
-              case 0x04: // IPv6
-                address = data.sublist(4, 20).map((b) => b.toRadixString(16)).join(':');
-                port = (data[20] << 8) | data[21];
-                break;
-
-              case 0x03: // Domain name
-                final domainLength = data[4];
-                address = String.fromCharCodes(data.sublist(5, 5 + domainLength));
-                port = (data[5 + domainLength] << 8) | data[6 + domainLength];
-                break;
-
-              default:
-                _onSessionError('Unsupported address type: $addrType');
-                return;
-            }
-
-            try {
-              _destConn = await Socket.connect(address, port, timeout: Duration(seconds: 10));
-              currentState = States.proxying;
-
-              await _sendToClient(Uint8List.fromList([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
-
-              _destConn?.listen(
-                (data) => _sendToClient(data),
-                onDone: _onSessionClosed,
-                onError: (error) => _onSessionError('Destination connection error: $error'),
-              );
-
-            } catch (e) {
-              _onSessionError('Failed to connect to $address:$port: $e');
-            }
-            break;
-
-          case States.proxying:
-            await _sendToDest(data);
-            break;
-      }
+    try {
+      await _sendToDest(data);
     } catch (e) {
       _onSessionError('Unexpected error in session $sessionId: $e');
     }
@@ -119,6 +64,7 @@ class Socks5Session {
   }
 
   Future<void> _sendToDest(List<int> data) async {
+    await _connectionReady.future;
     await _destConnLock.synchronized(() async {
       if (_destConn != null) {
         try {
@@ -130,8 +76,17 @@ class Socks5Session {
         } catch (e) {
           _onSessionError('Failed to send data to destination: $e');
         }
+      } else {
+        print("destConn for session $sessionId is not available");
       }
     });
+  }
+
+  void _processQueuedPackets() {
+    while (_packetQueue.isNotEmpty) {
+      final data = _packetQueue.removeFirst();
+      processSocks5Data(data);
+    }
   }
 
   void _onSessionError(String message) {

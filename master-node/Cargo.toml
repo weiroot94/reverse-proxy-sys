@@ -1,6 +1,6 @@
 [package]
 name = "net-relay"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["topsoftdeveloper@outlook.com"]
 edition = "2021"
 readme = "README.md"

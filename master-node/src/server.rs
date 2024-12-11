@@ -20,7 +20,7 @@ use crate::packet::{
 use crate::buffer_pool::MAX_BUF_SIZE;
 use crate::utils::CLIENT_REQUEST_TIMEOUT;
 
-const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.7"];
+const ALLOWED_SLAVE_VERSIONS: &[&str] = &["1.0.8"];
 
 pub async fn start_slave_listener(
     master_addr: &str,
@@ -71,7 +71,7 @@ pub async fn start_client_listener(
     };
 
     loop {
-        let (client_stream, client_addr) = match client_listener.accept().await {
+        let (client_stream, _) = match client_listener.accept().await {
             Ok(stream) => stream,
             Err(e) => {
                 error!("Error accepting client connection: {}", e);
@@ -85,29 +85,31 @@ pub async fn start_client_listener(
             continue;
         }
 
-        // Retrieve an available slave stream
-        let client_ip = client_addr.ip().to_string();
-        if let Some(slave_tx) = proxy_manager.lock().await.get_available_slave_tx(&client_ip).await {
-            let client_stream = Arc::new(tokio::sync::Mutex::new(client_stream));
-            let session_id = rand::random::<u32>();
+        let client_stream = Arc::new(AsyncMutex::new(client_stream));
+        let session_id = rand::random::<u32>();
 
-            let (client_tx, client_rx) = mpsc::channel(100);
-            let client = Client::new(client_stream.clone(), client_tx);
+        let (client_tx, client_rx) = mpsc::channel(100);
+        let client = Client::new(client_stream.clone(), client_tx);
 
-            // Spawn a task to handle traffic between the client and the assigned slave
-            let proxy_manager_clone = Arc::clone(&proxy_manager);
-            let semaphore_clone = Arc::clone(&semaphore);
-            let buffer_pool_clone = Arc::clone(&client_buffer_pool);
-            tokio::spawn(handle_client_io(
+        // Spawn a task to handle traffic between the client and the assigned slave
+        let proxy_manager_clone = Arc::clone(&proxy_manager);
+        let semaphore_clone = Arc::clone(&semaphore);
+        let buffer_pool_clone = Arc::clone(&client_buffer_pool);
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_client_io(
                 session_id,
                 client,
-                slave_tx,
                 client_rx,
                 proxy_manager_clone,
                 semaphore_clone,
                 buffer_pool_clone,
-            ));
-        }
+            )
+            .await
+            {
+                error!("Error handling client session {}: {}", session_id, e);
+            }
+        });
     }
 }
 

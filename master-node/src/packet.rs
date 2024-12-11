@@ -29,7 +29,7 @@ pub enum CommandType {
     VersionCheck = 0x02,
     Heartbeat = 0x03,
     LocationCheck = 0x04,
-    CloseSession = 0x05,
+    InitSession = 0x05,
 }
 
 impl CommandType {
@@ -39,7 +39,7 @@ impl CommandType {
             0x02 => Some(CommandType::VersionCheck),
             0x03 => Some(CommandType::Heartbeat),
             0x04 => Some(CommandType::LocationCheck),
-            0x05 => Some(CommandType::CloseSession),
+            0x05 => Some(CommandType::InitSession),
             _ => None,
         }
     }
@@ -73,8 +73,8 @@ pub fn build_heartbeat_command() -> Bytes {
     build_command_frame(PacketType::Command, 0, Some(CommandType::Heartbeat), &[])
 }
 
-pub fn build_close_session_command(session_id: u32) -> Bytes {
-    build_command_frame(PacketType::Command, session_id, Some(CommandType::CloseSession), &[])
+pub fn build_init_session_command(session_id: u32, payload: &str) -> Bytes {
+    build_command_frame(PacketType::Command, session_id, Some(CommandType::InitSession), payload.as_bytes())
 }
 
 pub fn build_location_check_command(ip: &str) -> Bytes {
@@ -139,7 +139,7 @@ pub async fn process_packet(
             }
         }
         Some(PacketType::Data) => {
-            debug!("sid {}, {} bytes : SLAVE replied", session_id, payload.len());
+            debug!("sid {}, {} bytes : SLAVE -> MASTER", session_id, payload.len());
             proxy_manager.lock().await.route_to_client(session_id, payload).await;
         }
         None => {

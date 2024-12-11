@@ -18,7 +18,7 @@ const int speedCheck = 0x01;
 const int versionCheck = 0x02;
 const int heartbeatCheck = 0x03;
 const int locationCheck = 0x04;
-const int closeSession = 0x05;
+const int initSession = 0x05;
 
 class ProtocolPacket {
   final int sessionId;
@@ -96,12 +96,7 @@ class TunSocks {
           .transform(StreamTransformer.fromBind((stream) => MasterTrafficParser().bind(stream)))
           .listen((packet) async {
             if (packet.packetType == dataPacket) {
-              // Handle data packets through SOCKS5 sessions
-              final session = sessions.putIfAbsent(
-                  packet.sessionId,
-                  () => Socks5Session(packet.sessionId, _masterConn, _sendDataPacket));
-              session.processSocks5Data(packet.payload);
-
+              await _handleData(packet.sessionId, packet.payload);
             } else if (packet.packetType == commandPacket) {
               await _handleCommand(packet.sessionId, packet.commandId, packet.payload);
             }
@@ -120,13 +115,21 @@ class TunSocks {
     }
   }
 
+  Future<void> _handleData(int sessionId, List<int> payload) async {
+    final session = sessions[sessionId];
+    if (session != null) {
+      await session.processSocks5Data(payload);
+    } else {
+      print('No session found for session ID $sessionId. Dropping data packet.');
+    }
+  }
+
   Future<void> _handleCommand(int sessionId, int? commandId, List<int> payload) async {
     switch (commandId) {
       case speedCheck:
         await _performSpeedTest(payload);
         break;
       case versionCheck:
-        print('version check command received');
         _sendVersionInfo();
         break;
       case heartbeatCheck:
@@ -135,16 +138,41 @@ class TunSocks {
         //_manageHeartbeatTimer();
         break;
       case locationCheck:
-        print('location check command received');
         await _performLocationCheck(payload);
         break;
-      case closeSession:
-        print('close_session command received session $sessionId');
-        _handleCloseSession(sessionId);
+      case initSession:
+        _handleInitSession(sessionId, payload);
         break;
       default:
         print('Unknown command received');
     }
+  }
+
+  Future<void> _handleInitSession(int sessionId, List<int> payload) async {
+    if (sessions.containsKey(sessionId)) {
+      print('Session $sessionId already exists.');
+      return;
+    }
+
+    final destinationInfo = utf8.decode(payload);
+    final splitIndex = destinationInfo.lastIndexOf(':');
+    if (splitIndex == -1) {
+      print('Invalid destination info: $destinationInfo');
+      return;
+    }
+
+    final address = destinationInfo.substring(0, splitIndex);
+    final port = int.tryParse(destinationInfo.substring(splitIndex + 1));
+
+    if (port == null) {
+      print('Invalid port in destination info: $destinationInfo');
+      return;
+    }
+
+    final session = Socks5Session(sessionId, _masterConn, _sendDataPacket);
+    await session.initialize(address, port);
+
+    sessions[sessionId] = session;
   }
 
   void _handleDisconnection() {
@@ -217,14 +245,6 @@ class TunSocks {
       }
     } catch (e) {
       print('Error fetching location data: $e');
-    }
-  }
-
-  void _handleCloseSession(int sessionId) {
-    if (sessions.containsKey(sessionId)) {
-      sessions[sessionId]?.closeSession();
-    } else {
-      print('Session ID $sessionId not found');
     }
   }
 
