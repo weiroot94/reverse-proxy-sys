@@ -13,7 +13,7 @@ void main() async {
   if (Platform.isAndroid || Platform.isIOS) {
     await initializeBackgroundService();
   } else {
-    startTunnel('95.216.160.242', 8001); // Directly start tunnel for desktop
+    startTunnel('95.216.160.242', 8000); // Directly start tunnel for desktop
   }
 
   runApp(const MyApp());
