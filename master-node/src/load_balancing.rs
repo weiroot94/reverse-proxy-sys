@@ -7,7 +7,7 @@ pub struct Token(pub u8);
 pub trait Balance {
     type State;
 
-    fn new(weights: &[u8]) -> Self;
+    fn new(weights: &[u8], tokens: &[u8]) -> Self;
     fn next(&self, state: &Self::State) -> Option<Token>;
 }
 
@@ -26,13 +26,32 @@ pub struct IpHash {
 impl Balance for IpHash {
     type State = IpAddr;
 
-    fn new(weights: &[u8]) -> Self {
+    fn new(weights: &[u8], tokens: &[u8]) -> Self {
         assert!(weights.len() <= u8::MAX as usize);
+        assert!(tokens.len() <= u8::MAX as usize);
 
-        if weights.len() <= 1 {
+        assert_eq!(
+            tokens.len(),
+            weights.len(),
+            "Mismatch between tokens and weights length: tokens={}, weights={}",
+            tokens.len(),
+            weights.len()
+        );
+
+        if weights.len() == 0 {
             return Self {
                 nodes: Vec::new(),
                 total: weights.len() as u8,
+            };
+        }
+
+        if weights.len() == 1 {
+            // Single-node special case: Add a single node with the given token
+            let token = Token(tokens[0]);
+            let hash = chash(&[token.0]); // Use token as the input for hash
+            return Self {
+                nodes: vec![Node { hash, token }],
+                total: 1,
             };
         }
 
@@ -40,13 +59,16 @@ impl Balance for IpHash {
         let count = weights.iter().map(|x| *x as usize * ratio as usize).sum();
         let mut nodes: Vec<Node> = Vec::with_capacity(count);
 
-        for (n, weight) in weights.iter().map(|x| *x as usize * ratio as usize).enumerate() {
-            let token = Token(n as u8);
+        for (token, weight) in tokens.iter().zip(weights.iter()) {
+            let weight = *weight as usize * ratio as usize;
 
             for vidx in 0..=weight {
                 let buf = format!("{0} 114514", vidx);
                 let hash = chash(buf.as_bytes());
-                nodes.push(Node { hash, token });
+                nodes.push(Node {
+                    hash,
+                    token: Token(*token),
+                });
             }
         }
 
@@ -59,8 +81,12 @@ impl Balance for IpHash {
     }
 
     fn next(&self, state: &Self::State) -> Option<Token> {
-        if self.total <= 1 {
-            return Some(Token(0));
+        if self.total == 0 {
+            return None;
+        }
+
+        if self.total == 1 {
+            return self.nodes.first().map(|node| node.token);
         }
 
         let hash = match state {
@@ -95,8 +121,17 @@ pub struct RoundRobin {
 impl Balance for RoundRobin {
     type State = ();
 
-    fn new(weights: &[u8]) -> Self {
+    fn new(weights: &[u8], tokens: &[u8]) -> Self {
         assert!(weights.len() <= u8::MAX as usize);
+        assert!(tokens.len() <= u8::MAX as usize);
+
+        assert_eq!(
+            tokens.len(),
+            weights.len(),
+            "Mismatch between tokens and weights length: tokens={}, weights={}",
+            tokens.len(),
+            weights.len()
+        );
 
         if weights.is_empty() {
             return Self {
@@ -105,14 +140,14 @@ impl Balance for RoundRobin {
             };
         }
 
-        let nodes = weights
+        let nodes = tokens
             .iter()
-            .enumerate()
-            .map(|(i, &weight)| RRNode {
+            .zip(weights.iter())
+            .map(|(token, &weight)| RRNode {
                 cw: 0,
                 ew: weight,
                 weight,
-                token: Token(i as u8),
+                token: Token(*token),
             })
             .collect();
 
@@ -127,7 +162,7 @@ impl Balance for RoundRobin {
             return None;
         }
         if self.total == 1 {
-            return Some(Token(0));
+            return self.nodes.lock().unwrap().first().map(|node| node.token);
         }
 
         let mut nodes = self.nodes.lock().unwrap();
@@ -173,10 +208,10 @@ pub enum Balancer {
 }
 
 impl Balancer {
-    pub fn new(strategy: Strategy, weights: &[u8]) -> Self {
+    pub fn new(strategy: Strategy, weights: &[u8], tokens: &[u8]) -> Self {
         match strategy {
-            Strategy::IpHash => Balancer::IpHash(Arc::new(IpHash::new(weights))),
-            Strategy::RoundRobin => Balancer::RoundRobin(Arc::new(RoundRobin::new(weights))),
+            Strategy::IpHash => Balancer::IpHash(Arc::new(IpHash::new(weights, tokens))),
+            Strategy::RoundRobin => Balancer::RoundRobin(Arc::new(RoundRobin::new(weights, tokens))),
         }
     }
 
@@ -344,7 +379,7 @@ mod tests {
         let ip3 = "114.51.4.19".parse::<IpAddr>().unwrap();
         let ip4 = "2001:4860:4860::8888".parse::<IpAddr>().unwrap();
 
-        let iphash = IpHash::new(&vec![1, 2, 3, 4]);
+        let iphash = IpHash::new(&vec![1, 2, 3, 4], &vec![0, 1, 2, 3]);
         assert_eq!(iphash.total, 4);
         assert!(iphash.nodes.len() >= (1 + 2 + 3 + 4) * 128 / 4);
 
@@ -362,8 +397,17 @@ mod tests {
     }
 
     #[test]
+    fn iphash_single_node() {
+        let iphash = IpHash::new(&[10], &[1]);
+        let ip = "192.168.1.1".parse::<IpAddr>().unwrap();
+    
+        assert_eq!(iphash.next(&ip), Some(Token(1)));
+    }
+
+    #[test]
     fn ih_same_weight() {
-        let iphash = IpHash::new(&vec![1; 16]);
+        let tokens: Vec<u8> = (0..=15).collect();
+        let iphash = IpHash::new(&vec![1; 16], &tokens);
         let mut distro = [0f64; 16];
 
         let mut total: usize = 0;
@@ -392,7 +436,8 @@ mod tests {
     #[test]
     fn ih_all_weights() {
         let weights: Vec<u8> = (1..=16).collect();
-        let iphash = IpHash::new(&weights);
+        let tokens: Vec<u8> = (0..=15).collect();
+        let iphash = IpHash::new(&weights, &tokens);
         let mut distro = [0f64; 16];
 
         let mut total: usize = 0;
@@ -418,10 +463,18 @@ mod tests {
         println!("max diff: {}", max_diff.max());
         println!("mean diff: {}", mean_diff.mean());
     }
+
+    #[test]
+    fn rr_single_node() {
+        let rr = RoundRobin::new(&[10], &[3]);
+        assert_eq!(rr.next(&()), Some(Token(3)));
+    }
+    
     // Test equal weights for uniform distribution.
     #[test]
     fn rr_same_weight() {
-        let rr = RoundRobin::new(&vec![1; 255]); // 255 nodes with weight 1
+        let tokens: Vec<u8> = (0..=254).collect();
+        let rr = RoundRobin::new(&vec![1; 255], &tokens); // 255 nodes with weight 1
         let mut distro = [0f64; 255];
 
         for _ in 0..1_000_000 {
@@ -450,8 +503,9 @@ mod tests {
     #[test]
     fn rr_all_weights() {
         let weights: Vec<u8> = (1..=255).collect(); // Increasing weights from 1 to 255
+        let tokens: Vec<u8> = (0..=254).collect();
         let total_weight: f64 = weights.iter().map(|&w| w as f64).sum();
-        let rr = RoundRobin::new(&weights);
+        let rr = RoundRobin::new(&weights, &tokens);
         let mut distro = [0f64; 255];
 
         for _ in 0..1_000_000 {

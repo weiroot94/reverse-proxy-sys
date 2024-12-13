@@ -122,7 +122,7 @@ impl ProxyManager {
         ProxyManager {
             slaves: DashMap::new(),
             clients: DashMap::new(),
-            balancer: Arc::new(AsyncMutex::new(Balancer::new(strategy, &[]))),
+            balancer: Arc::new(AsyncMutex::new(Balancer::new(strategy, &[], &[]))),
             balancing_strategy: strategy,
             token_counter: AtomicU8::new(0),
         }
@@ -138,8 +138,15 @@ impl ProxyManager {
             .iter()
             .map(|entry| entry.value().net_speed as u8)
             .collect();
+
+        let tokens: Vec<u8> = self
+            .slaves
+            .iter()
+            .map(|entry| entry.value().id_token as u8)
+            .collect();
+    
         let mut balancer = self.balancer.lock().await;
-        *balancer = Balancer::new(self.balancing_strategy, &weights);
+        *balancer = Balancer::new(self.balancing_strategy, &weights, &tokens);
     }
 
     pub async fn add_slave(&mut self, mut slave: Slave) {
@@ -159,23 +166,31 @@ impl ProxyManager {
     pub async fn get_available_slave_tx(
         &self,
         client_ip: &String,
-        requested_location: Option<&String>
+        requested_location: Option<&String>,
     ) -> Option<mpsc::Sender<Bytes>> {
+        trace!(
+            "Finding available slave for client IP: {}, Requested location: {:?}",
+            client_ip, requested_location
+        );
+    
         match IpAddr::from_str(client_ip) {
             Ok(parsed_ip) => {
                 if let Some(token) = self.balancer.lock().await.next(BalanceCtx { src_ip: &parsed_ip }) {
                     if let Some(slave) = self.slaves.get(&token.0.to_string()) {
-                        // If restricted location is empty, ignore location filtering
+                        debug!(
+                            "Found slave: {}, Token: {}, Location: {:?}",
+                            slave.ip_addr, token.0, slave.location
+                        );
+
+                        // Handle location filtering
                         if let Some(requested_location) = requested_location {
-                            if let Some(slave_location) = &slave.location {
-                                // Check if the slave matches the requested location
+                            if let Some(slave_location) = &slave.location {   
                                 if slave_location.eq_ignore_ascii_case(requested_location) {
                                     return Some(slave.tx.clone());
                                 } else {
-                                    trace!(
-                                        "Slave {} does not match requested location {}",
-                                        token.0,
-                                        requested_location
+                                    debug!(
+                                        "Location mismatch. Slave location: {}, Requested location: {}",
+                                        slave_location, requested_location
                                     );
                                 }
                             } else {
@@ -188,7 +203,11 @@ impl ProxyManager {
                             // No location requested, return the slave
                             return Some(slave.tx.clone());
                         }
+                    } else {
+                        trace!("No slave found for token: {}", token.0);
                     }
+                } else {
+                    trace!("Balancer did not return a valid token.");
                 }
             }
             Err(_) => {
@@ -345,9 +364,15 @@ pub async fn handle_client_io(
 
     // Process SOCKS5 handshake and extract username, destination information
     let (username, dest_address, dest_port) = match handle_client_handshake(&mut cli_stream).await {
-        Ok(result) => result,
+        Ok(result) => {
+            debug!(
+                "Session {}: Handshake successful. Username: {:?}, Destination: {}:{}",
+                session_id, result.0, result.1, result.2
+            );
+            result
+        },
         Err(e) => {
-            error!(
+            debug!(
                 "Error during SOCKS5 handshake for session {}: {}",
                 session_id, e
             );
@@ -362,7 +387,7 @@ pub async fn handle_client_io(
     let slave_tx = match slave_tx {
         Some(tx) => tx,
         None => {
-            error!(
+            debug!(
                 "No suitable slave found for session {} (username: {:?})",
                 session_id, username
             );
@@ -380,7 +405,7 @@ pub async fn handle_client_io(
         .await
         .is_err()
     {
-        warn!("Failed to send data to slave for session {}", session_id);
+        debug!("Failed to send data to slave for session {}", session_id);
         return Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "Failed to send to slave tx",
@@ -411,7 +436,7 @@ pub async fn handle_client_io(
                         let data = buffer.split().freeze();
                         let data_packet = build_data_frame(session_id, &data);
 
-                        if slave_tx.send(data_packet).await.is_err() {
+                        if timeout(CLIENT_REQUEST_TIMEOUT, slave_tx.send(data_packet)).await.is_err() {
                             warn!("Failed to send data to slave for session {}", session_id);
                             break;
                         }
