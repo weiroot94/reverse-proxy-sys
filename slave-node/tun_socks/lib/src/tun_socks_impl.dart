@@ -215,6 +215,7 @@ class TunSocks {
         await _masterConn?.flush();
       } catch (e) {
         print('Failed to send to master: $e');
+        _handleDisconnection();
       }
     });
   }
