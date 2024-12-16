@@ -6,57 +6,10 @@ import 'dart:typed_data';
 import 'dart:convert';
 
 import 'socks5_session.dart';
+import 'protocol.dart';
 import 'version.dart';
 
 enum ProxyState { disconnected, connecting, connected, }
-
-// Command Type constants
-const int dataPacket = 0x00;
-const int commandPacket = 0x01;
-// Command ID constants
-const int speedCheck = 0x01;
-const int versionCheck = 0x02;
-const int heartbeatCheck = 0x03;
-const int locationCheck = 0x04;
-const int initSession = 0x05;
-
-class ProtocolPacket {
-  final int sessionId;
-  final int packetType;
-  final int commandId;
-  final List<int> payload;
-
-  ProtocolPacket(this.sessionId, this.packetType, this.commandId, this.payload);
-}
-
-class MasterTrafficParser extends StreamTransformerBase<List<int>, ProtocolPacket> {
-  final List<int> _buffer = [];
-
-  @override
-  Stream<ProtocolPacket> bind(Stream<List<int>> stream) async* {
-    await for (var dataChunk in stream) {
-      _buffer.addAll(dataChunk);
-
-      while (_buffer.length >= 10) {
-        final packetType = _buffer[0];
-        final sessionId = _bytesToInt(_buffer.sublist(1, 5));
-        final commandId = _buffer[5];
-        final payloadLength = _bytesToInt(_buffer.sublist(6, 10));
-
-        if (_buffer.length < 10 + payloadLength) break;
-
-        final payload = _buffer.sublist(10, 10 + payloadLength);
-        _buffer.removeRange(0, 10 + payloadLength);
-
-        yield ProtocolPacket(sessionId, packetType, commandId, payload);
-      }
-    }
-  }
-
-  int _bytesToInt(List<int> bytes) {
-    return bytes.fold(0, (acc, byte) => (acc << 8) + byte);
-  }
-}
 
 class TunSocks {
   final String host;
@@ -69,10 +22,6 @@ class TunSocks {
   List<int> accumulatedBuffer = [];
   bool isManuallyStopped = false;
   
-  // Heartbeat Monitoring
-  Timer? _heartbeatTimer;
-  final Duration heartbeatInterval = Duration(seconds: 30);
-
   TunSocks({
     required this.host,
     required this.port,
@@ -135,7 +84,6 @@ class TunSocks {
       case heartbeatCheck:
         print('heartbeat command received');
         _sendAliveResponse();
-        //_manageHeartbeatTimer();
         break;
       case locationCheck:
         await _performLocationCheck(payload);
@@ -195,17 +143,6 @@ class TunSocks {
 
     print('Retrying connection... Attempt $retryAttempts');
     startTunnel();
-  }
-
-  void _manageHeartbeatTimer() {
-    // Cancel any existing heartbeat timer
-    _heartbeatTimer?.cancel();
-
-    // Start a new timer to wait for the next heartbeat
-    _heartbeatTimer = Timer(heartbeatInterval, () {
-      print("No heartbeat from master, reconnecting...");
-      _handleDisconnection();
-    });
   }
 
   Future<void> _performSpeedTest(List<int> payload) async {
