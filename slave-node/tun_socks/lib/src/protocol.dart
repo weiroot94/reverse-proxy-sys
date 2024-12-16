@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'utils.dart';
 
 // Command Type constants
 const int dataPacket = 0x00;
@@ -8,7 +9,7 @@ const int commandPacket = 0x01;
 const int speedCheck = 0x01;
 const int versionCheck = 0x02;
 const int heartbeatCheck = 0x03;
-const int locationCheck = 0x04;
+const int urlCheck = 0x04;
 const int initSession = 0x05;
 
 class ProtocolPacket {
@@ -30,9 +31,9 @@ class MasterTrafficParser extends StreamTransformerBase<List<int>, ProtocolPacke
 
       while (_buffer.length >= 10) {
         final packetType = _buffer[0];
-        final sessionId = _bytesToInt(_buffer.sublist(1, 5));
+        final sessionId = ByteUtils.bytesToInt(_buffer.sublist(1, 5));
         final commandId = _buffer[5];
-        final payloadLength = _bytesToInt(_buffer.sublist(6, 10));
+        final payloadLength = ByteUtils.bytesToInt(_buffer.sublist(6, 10));
 
         if (_buffer.length < 10 + payloadLength) break;
 
@@ -42,9 +43,5 @@ class MasterTrafficParser extends StreamTransformerBase<List<int>, ProtocolPacke
         yield ProtocolPacket(sessionId, packetType, commandId, payload);
       }
     }
-  }
-
-  int _bytesToInt(List<int> bytes) {
-    return bytes.fold(0, (acc, byte) => (acc << 8) + byte);
   }
 }

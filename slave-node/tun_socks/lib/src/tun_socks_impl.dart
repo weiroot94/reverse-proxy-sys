@@ -7,6 +7,7 @@ import 'dart:convert';
 
 import 'socks5_session.dart';
 import 'protocol.dart';
+import 'utils.dart';
 import 'version.dart';
 
 enum ProxyState { disconnected, connecting, connected, }
@@ -85,8 +86,8 @@ class TunSocks {
         print('heartbeat command received');
         _sendAliveResponse();
         break;
-      case locationCheck:
-        await _performLocationCheck(payload);
+      case urlCheck:
+        await _performUrlCheck(payload);
         break;
       case initSession:
         _handleInitSession(sessionId, payload);
@@ -169,32 +170,18 @@ class TunSocks {
     }
   }
 
-  Future<void> _performLocationCheck(List<int> payload) async {
-    final locationApiUrl = utf8.decode(payload);
+  Future<void> _performUrlCheck(List<int> payload) async {
+    final targetUrl = utf8.decode(payload);
     try {
-      final response = await http.get(Uri.parse(locationApiUrl));
+      final response = await http.get(Uri.parse(targetUrl));
       if (response.statusCode == 200) {
-        final locationInfo = response.body;
-        _sendLocationInfo(locationInfo);
+        _sendUrlCheckResponse(response.body);
       } else {
         print('Failed to fetch location data: ${response.statusCode}');
       }
     } catch (e) {
       print('Error fetching location data: $e');
     }
-  }
-
-  int _bytesToInt(List<int> bytes) {
-    return bytes.fold(0, (previousValue, element) => (previousValue << 8) + element);
-  }
-
-  List<int> _intToBytes(int value) {
-    return [
-      (value >> 24) & 0xFF,
-      (value >> 16) & 0xFF,
-      (value >> 8) & 0xFF,
-      value & 0xFF,
-    ];
   }
 
   void _sendToMasterInProtocol(int sessionId, List<int> payload, {int packetType = dataPacket, int commandId = 0x00}) async {
@@ -205,9 +192,9 @@ class TunSocks {
       }
       final packet = [
         packetType,                      // Packet Type (0x00 for data, 0x01 for command)
-        ..._intToBytes(sessionId),       // Session ID
+        ...ByteUtils.intToBytes(sessionId),       // Session ID
         commandId,                       // Command ID (default to 0x00 for data packets)
-        ..._intToBytes(payload.length),  // Payload Length
+        ...ByteUtils.intToBytes(payload.length),  // Payload Length
         ...payload                       // Payload data
       ];
       try {
@@ -226,9 +213,9 @@ class TunSocks {
     _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: speedCheck);
   }
 
-  void _sendLocationInfo(String locationInfo) {
-    final payload = utf8.encode(locationInfo);
-    _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: locationCheck);
+  void _sendUrlCheckResponse(String response) {
+    final payload = utf8.encode(response);
+    _sendToMasterInProtocol(0, payload, packetType: commandPacket, commandId: urlCheck);
   }
 
   void _sendVersionInfo() {
