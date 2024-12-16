@@ -248,8 +248,6 @@ pub async fn handle_slave_io(
     let mut last_seen = Instant::now();
     let mut last_heartbeat_sent = Instant::now();
 
-    let mut error_occurred = false;
-
     loop {
         tokio::select! {
             // Handle incoming traffic from the slave
@@ -286,11 +284,6 @@ pub async fn handle_slave_io(
                         &mut last_seen,
                     ).await {
                         trace!("Critical error processing packet: {}. Exiting loop.", _err);
-                        error_occurred = true;
-                        break;
-                    }
-
-                    if error_occurred {
                         break;
                     }
                 }
@@ -310,7 +303,7 @@ pub async fn handle_slave_io(
                     let heartbeat_command = build_heartbeat_command();
                     if let Err(err) = slave.write_stream(&heartbeat_command).await {
                         warn!("Failed to send heartbeat to slave {}: {}. Disconnecting.", slave.ip_addr, err);
-                        return Err(err);
+                        break;
                     }
                     trace!("Sent heartbeat to slave {}", slave.ip_addr);
                     last_heartbeat_sent = Instant::now();
@@ -321,21 +314,9 @@ pub async fn handle_slave_io(
             _ = tokio::time::sleep_until(last_seen + max_heartbeat_timeout) => {
                 if last_seen.elapsed() >= max_heartbeat_timeout {
                     warn!("Slave {} did not respond within the maximum allowed time. Disconnecting.", slave.ip_addr);
-
-                    buffer_pool.return_buffer(shard_id, buffer).await;
-
-                    proxy_manager.lock().await.remove_slave(&slave.id_token).await;
-
-                    metrics.slave_active_connections.dec();
-                    metrics.slave_disconnections.inc();
-
-                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Heartbeat timeout"));
+                    break;
                 }
             }
-        }
-
-        if error_occurred {
-            break;
         }
     }
     
@@ -431,7 +412,7 @@ pub async fn handle_client_io(
                             break;
                         }
 
-                        debug!("sid {}, {} bytes: CLIENT -> SLAVE", session_id, len);
+                        debug!("sid {}, {} bytes: CLIENT -> MASTER", session_id, len);
 
                         let data = buffer.split().freeze();
                         let data_packet = build_data_frame(session_id, &data);
