@@ -14,9 +14,7 @@ class Socks5Session {
   Socket? _destConn;
   final Lock _destConnLock = Lock();
   final Function(int, List<int>) _sendDataToMaster;
-  // Completer to signal readiness
   final Completer<void> _connectionReady = Completer<void>();
-  // Packet queue for initial processing
   final Queue<List<int>> _packetQueue = Queue();
 
   Socks5Session(this.sessionId, this._sendDataToMaster);
@@ -39,9 +37,9 @@ class Socks5Session {
     }
   }
 
+  /// Process incoming data from the master for the destination
   Future<void> processSocks5Data(List<int> data) async {
     if (!_connectionReady.isCompleted) {
-      // Queue data until initialization is ready
       print('Session $sessionId not initialized yet. Buffering packet.');
       _packetQueue.add(data);
       return;
@@ -54,6 +52,7 @@ class Socks5Session {
     }
   }
 
+  /// Sends data to relaying client
   Future<void> _sendToClient(List<int> data) async {
     try {
       await _sendDataToMaster(sessionId, data);
@@ -62,6 +61,7 @@ class Socks5Session {
     }
   }
 
+  /// Sends data to the destination
   Future<void> _sendToDest(List<int> data) async {
     await _connectionReady.future;
     await _destConnLock.synchronized(() async {
@@ -70,44 +70,52 @@ class Socks5Session {
           _destConn?.add(data);
           await _destConn?.flush();
         } on SocketException catch (e) {
-          print('Failed to send data to destination: $e');
+          print('Session $sessionId: Failed to send data to destination: $e');
           closeSession();
         } catch (e) {
-          _onSessionError('Failed to send data to destination: $e');
+          _onSessionError('Session $sessionId: Failed to send data to destination: $e');
         }
       } else {
-        print("destConn for session $sessionId is not available");
+        print('Session $sessionId: Destination connection is not available.');
       }
     });
   }
 
+  /// Processes packets that were queued before initialization
   void _processQueuedPackets() {
+    if (_packetQueue.isEmpty) return;
+
     while (_packetQueue.isNotEmpty) {
       final data = _packetQueue.removeFirst();
       processSocks5Data(data);
     }
   }
 
+ /// Handles session errors
   void _onSessionError(String message) {
-    print(message);
+    print('Session $sessionId: $message');
     closeSession();
   }
 
+  /// Handles session closure
   void _onSessionClosed() {
     closeSession();
   }
 
+  /// Closes the session and cleans up resources
   void closeSession() async {
-    // Remove session from sessions map
     sessions.remove(sessionId);
 
-    if (_destConn == null) {
-      return;
-    }
-
     await _destConnLock.synchronized(() async {
-      await _destConn?.close();
-      _destConn = null;
+      if (_destConn != null) {
+        try {
+          await _destConn!.close();
+        } catch (e) {
+          print('Session $sessionId: Error while closing destination connection: $e');
+        } finally {
+          _destConn = null;
+        }
+      }
     });
   }
 }

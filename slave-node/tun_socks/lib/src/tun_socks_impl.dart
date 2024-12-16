@@ -1,15 +1,13 @@
-import 'dart:io';
-import 'package:http/http.dart' as http;
-import 'package:synchronized/synchronized.dart';
 import 'dart:async';
-import 'dart:typed_data';
 import 'dart:convert';
+import 'dart:io';
+
+import 'package:synchronized/synchronized.dart';
 
 import 'command_handler.dart';
 import 'socks5_session.dart';
 import 'protocol.dart';
 import 'utils.dart';
-import 'version.dart';
 
 enum ProxyState { disconnected, connecting, connected, }
 
@@ -25,12 +23,11 @@ class TunSocks {
   bool isManuallyStopped = false;
 
   final CommandHandler commandHandler = CommandHandler();
+  final StreamController<List<int>> _incomingDataController = StreamController();
   
-  TunSocks({
-    required this.host,
-    required this.port,
-  });
+  TunSocks({required this.host, required this.port});
 
+  /// Starts the connection to the master server.
   Future<void> startTunnel() async {
     if (currentState != ProxyState.disconnected) {
         return;
@@ -38,8 +35,10 @@ class TunSocks {
 
     currentState = ProxyState.connecting;
     isManuallyStopped = false;
+    retryAttempts = 0;
 
     try {
+      print('Attempting to connect to master at $host:$port...');
       _masterConn = await Socket.connect(host, port).timeout(Duration(seconds: 5));
 
       print('Connected to master node at $host:$port');
@@ -54,20 +53,17 @@ class TunSocks {
               await _handleCommand(packet.sessionId, packet.commandId, packet.payload);
             }
           },
-          onDone: () {
-            print('Connection to master was closed.');
-            _handleDisconnection();
-            },
-          onError: (error) {
-            print('Master connection error: $error');
-            _handleDisconnection();
-          });
+          onError: (error) => _handleSocketError(error),
+          onDone: () => _handleSocketClose(),
+          cancelOnError: true,
+        );
     } catch (e) {
       print('Failed to connect to master: $e');
       _handleDisconnection();
     }
   }
 
+  /// Handles data packets from the master node
   Future<void> _handleData(int sessionId, List<int> payload) async {
     final session = sessions[sessionId];
     if (session != null) {
@@ -77,10 +73,16 @@ class TunSocks {
     }
   }
 
+  /// Handles command packets from the master node.
   Future<void> _handleCommand(int sessionId, int? commandId, List<int> payload) async {
-    await commandHandler.handleCommand(sessionId, commandId, payload, this);
+    try {
+      await commandHandler.handleCommand(sessionId, commandId, payload, this);
+    } catch (e) {
+      print('Error handling command: $e');
+    }
   }
 
+  /// Handles disconnection logic and retries.
   void _handleDisconnection() {
     if (currentState == ProxyState.disconnected) return;
 
@@ -92,17 +94,16 @@ class TunSocks {
     }
   }
 
+  /// Attempts to reconnect to the master node with exponential backoff.
   Future<void> _retryConnection() async {
-    final retryDelay = (retryAttempts % 5 == 0 && retryAttempts != 0)
-        ? Duration(minutes: 1)
-        : Duration(seconds: 5);
+    final retryDelay = Duration(seconds: 5 * (retryAttempts + 1));
     retryAttempts++;
+    print('Retrying connection... Attempt $retryAttempts after ${retryDelay.inSeconds} seconds.');
     await Future.delayed(retryDelay);
-
-    print('Retrying connection... Attempt $retryAttempts');
     startTunnel();
   }
 
+  /// Sends a packet to the master server.
   void sendToMaster(int sessionId, List<int> payload, {int packetType = dataPacket, int commandId = 0x00}) async {
     await _masterConnLock.synchronized(() async {
       if (_masterConn == null || currentState != ProxyState.connected) {
@@ -126,17 +127,31 @@ class TunSocks {
     });
   }
 
-  // Data packet example:
+  /// Sends a data packet to the master node.
   void sendDataPacket(int sessionId, List<int> data) {
     sendToMaster(sessionId, data);
   }
 
+  /// Handles socket closure events.
+  void _handleSocketClose() {
+    print('Connection to master was closed.');
+    _handleDisconnection();
+  }
+
+  /// Handles socket errors.
+  void _handleSocketError(Object error) {
+    print('Master connection error: $error');
+    _handleDisconnection();
+  }
+
+  /// Stops the tunnel manually.
   void stopTunnel() {
     isManuallyStopped = true;
     _cleanupConnections();
     print('Proxy server stopped.');
   }
 
+  /// Cleans up connections and resources.
   void _cleanupConnections() {
     _masterConnLock.synchronized(() async {
       if (_masterConn != null) {
