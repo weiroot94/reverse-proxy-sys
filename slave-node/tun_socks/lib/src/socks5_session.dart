@@ -11,7 +11,6 @@ Map<int, Socks5Session> sessions = {};
 // Handler for SOCKS5 server connections
 class Socks5Session {
   final int sessionId;
-  final Socket? _masterConn;
   Socket? _destConn;
   final Lock _destConnLock = Lock();
   final Function(int, List<int>) _sendDataToMaster;
@@ -20,7 +19,7 @@ class Socks5Session {
   // Packet queue for initial processing
   final Queue<List<int>> _packetQueue = Queue();
 
-  Socks5Session(this.sessionId, this._masterConn, this._sendDataToMaster);
+  Socks5Session(this.sessionId, this._sendDataToMaster);
 
   /// Initialize the session and connect to the destination
   Future<void> initialize(String destAddress, int destPort) async {

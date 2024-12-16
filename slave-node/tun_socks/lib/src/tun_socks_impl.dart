@@ -169,7 +169,7 @@ class TunSocks {
       return;
     }
 
-    final session = Socks5Session(sessionId, _masterConn, _sendDataPacket);
+    final session = Socks5Session(sessionId, _sendDataPacket);
     sessions[sessionId] = session;
     await session.initialize(address, port);
   }
