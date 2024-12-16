@@ -23,7 +23,6 @@ class TunSocks {
   bool isManuallyStopped = false;
 
   final CommandHandler commandHandler = CommandHandler();
-  final StreamController<List<int>> _incomingDataController = StreamController();
   
   TunSocks({required this.host, required this.port});
 
